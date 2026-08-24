@@ -1,6 +1,6 @@
 # ATLAS-SRAD
 
-ATLAS-SRAD contains the source code for Brad Morrows SRAD avionics system.
+ATLAS-SRAD contains the source code for the Algonquin College Rocketry SRAD avionics system.
 
 The repository contains four main systems:
 
@@ -18,8 +18,16 @@ The repository contains four main systems:
 
 ## Repository Structure
 
+```text
 atlas-srad/
 ├── atlas-v2-onboard/
 ├── atlas-v1-ground-station/
 ├── gs-esp32/
 └── gs-ui/
+```
+
+## Purpose
+
+This repository provides one location for all ATLAS SRAD flight and ground station software.
+
+Git is used to track changes, maintain known working versions, and allow development without losing previous stable code.
