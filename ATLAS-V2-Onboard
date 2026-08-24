@@ -17,9 +17,7 @@ UART_HandleTypeDef huart1;
 #define LED_PIN GPIO_PIN_9
 #define BUZZER_PORT GPIOA
 #define BUZZER_PIN GPIO_PIN_15
-/* Flight-event indicator outputs.
-* These pins drive the onboard camera-visible indicator LEDs.
-*/
+
 #define PYRO_ARM_PORT      GPIOB
 #define PYRO_ARM_PIN       GPIO_PIN_0
 #define APO_FIRE_PORT      GPIOA
@@ -48,19 +46,7 @@ UART_HandleTypeDef huart1;
 #define LORA_RETRY_INTERVAL_MS 5000UL
 #define GPS_RETRY_INTERVAL_MS 3000UL
 #define GPS_SERVICE_INTERVAL_MS 50UL
-/* ==========================================================================
-* ATLAS V2 flight logic
-* ==========================================================================
-*
-* This build is FLIGHT-ALONG CAMERA-INDICATOR ONLY.
-*
-* ATLAS V2 detects and records the same flight events a controlling flight
-* computer would use. PB0, PA0, and PA3 drive camera-visible indicator LEDs
-* at the corresponding ARM, APO, and MAIN events. PB2 AUX always stays LOW.
-*
-* Launch detection is orientation-independent. Acceleration magnitude is used,
-* so the PCB does not need a fixed mounting orientation inside the rocket.
-*/
+
 #define FLIGHT_LOGIC_INTERVAL_MS                 10UL
 #define FLIGHT_LAUNCH_HIGHG_THRESHOLD_MG       2500UL
 #define FLIGHT_LAUNCH_IMU_FALLBACK_MG          1800UL
@@ -68,15 +54,7 @@ UART_HandleTypeDef huart1;
 #define FLIGHT_BURNOUT_MIN_AFTER_LAUNCH_MS       750UL
 #define FLIGHT_BURNOUT_LOW_ACCEL_MG             1800UL
 #define FLIGHT_BURNOUT_CONFIRM_MS                 250UL
-/*
-* The barometer is still sampled and logged while untrusted.
-* It is simply prevented from advancing the flight state during powered and
-* high-speed flight.
-*
-* After burnout, GPS 3D speed provides the preferred indication that the
-* rocket has left the transonic/high-speed region. If GPS is unavailable,
-* a conservative time fallback eventually enables barometric apogee logic.
-*/
+
 #define FLIGHT_BARO_TRUST_MIN_AFTER_BURNOUT_MS   1500UL
 #define FLIGHT_BARO_TRUST_GPS_SPEED_MMPS       250000UL
 #define FLIGHT_BARO_TRUST_GPS_FRESH_MS           1500UL
@@ -87,15 +65,7 @@ UART_HandleTypeDef huart1;
 #define FLIGHT_APOGEE_DESCENT_FT10S                -50L
 #define FLIGHT_APOGEE_CONFIRM_MS                   300UL
 #define FLIGHT_APOGEE_MIN_AFTER_BARO_TRUST_MS      1000UL
-/*
-* Main deployment has two post-apogee paths:
-*
-* 1. Normal altitude deployment at the GS-configured AGL altitude.
-* 2. Emergency deployment if descent reaches the ballistic threshold.
-*
-* MAIN LOGIC IS HARD-GATED BY confirmed apogee. Neither path is evaluated
-* before flight_apogee_detected is latched.
-*/
+
 #define FLIGHT_MAIN_DEPLOY_DEFAULT_ALT_FT           1500UL
 #define FLIGHT_MAIN_DEPLOY_MIN_ALT_FT                100UL
 #define FLIGHT_MAIN_DEPLOY_MAX_ALT_FT              10000UL
@@ -112,9 +82,7 @@ UART_HandleTypeDef huart1;
 #define FLIGHT_LANDING_GYRO_MAX_DPS10               500UL
 #define FLIGHT_LANDING_CONFIRM_MS                 10000UL
 #define FLIGHT_RECOVERY_ENTRY_DELAY_MS             2000UL
-/* Recovery-mode service rates. No MCU STOP mode is used in this validation
-* build so USB/debug behavior remains predictable. Peripheral work is reduced.
-*/
+
 #define RECOVERY_TELEMETRY_EARLY_MS                5000UL
 #define RECOVERY_TELEMETRY_MID_MS                 10000UL
 #define RECOVERY_TELEMETRY_LATE_MS                30000UL
@@ -133,16 +101,10 @@ UART_HandleTypeDef huart1;
 #define RECOVERY_SD_SYNC_INTERVAL_MS               5000UL
 #define SDLOG_START_RETRY_INTERVAL_MS                 5000UL
 #define FLIGHT_SENSOR_HEALTH_RECHECK_MS                100UL
-/* STM32F4 IWDG: prescaler /256, reload 999 gives about 8 s nominal at 32 kHz LSI. */
+
 #define ATLAS_IWDG_PRESCALER_BITS                         6U
 #define ATLAS_IWDG_RELOAD_VALUE                         999U
-/* AUX channel repurposed as onboard battery sense.
-* AUX+ and AUX- must be jumpered.
-* PB0 is the ARM indicator: LOW before launch, HIGH from confirmed launch
-* through confirmed landing.
-* PB1 = ADC1 channel 9.
-* PB2 = AUX FIRE and must NEVER be driven HIGH.
-*/
+
 #define BAT_DIV_TOP_OHMS       101000UL
 #define BAT_DIV_BOTTOM_OHMS     47000UL
 #define BAT_ADC_REFERENCE_MV      3300UL
@@ -198,11 +160,7 @@ UART_HandleTypeDef huart1;
 #define LSM6_CTRL9_XL            0x18
 #define LSM6_CTRL10_C            0x19
 #define LSM6_OUTX_L_G            0x22
-/* ADXL372 high-G accelerometer on SPI3, CS = PC13.
-* ADXL372 SPI requires CPOL=0, CPHA=0 (SPI mode 0).
-* Existing LSM6 IMUs on SPI3 use CPOL=1, CPHA=1 (SPI mode 3),
-* so the SPI3 mode is switched explicitly for each device access.
-*/
+
 #define ADXL372_DEVID_AD          0x00U
 #define ADXL372_DEVID_MST         0x01U
 #define ADXL372_PARTID            0x02U
@@ -219,26 +177,11 @@ UART_HandleTypeDef huart1;
 #define ADXL372_RESET_CODE        0x52U
 #define ADXL372_REG_READ(reg)     ((uint8_t)(((reg) << 1) | 0x01U))
 #define ADXL372_REG_WRITE(reg)    ((uint8_t)((reg) << 1))
-/* TIMING: ODR = 3200 Hz, internal clock, internal sync. */
 #define ADXL372_TIMING_3200HZ     0x60U
-/* MEASURE: 1600 Hz bandwidth, normal-noise mode. */
 #define ADXL372_MEASURE_1600HZ_BW 0x03U
-/* POWER_CTL:
-* FILTER_SETTLE = 1 (16 ms)
-* MODE = 11 (full bandwidth measurement)
-*/
 #define ADXL372_POWER_FULL_BW 0x1FU
-/* 12-bit acceleration output scale = 100 mg/LSB. */
 #define ADXL372_MG_PER_LSB        100L
-/*
-* Permanent V3 black-box region.
-*
-* We start V3 at 0x100000 so the earlier 64-byte development/test logs
-* already stored below this address are left untouched.
-*
-* After the format is fully finalized and the flash is manually cleared,
-* BLACKBOX_START_ADDR can be moved back down if desired.
-*/
+
 #define BLACKBOX_START_ADDR          0x000000UL
 #define BLACKBOX_END_ADDR            0x1000000UL
 #define BLACKBOX_RECORD_SIZE         128UL
@@ -266,13 +209,9 @@ UART_HandleTypeDef huart1;
 * Current bring-up rates:
 *   IMU1 + IMU2        200 Hz
 *   ADXL372 high-G     500 Hz
-*   Barometer           10 Hz  (matches current Baro_Service rate)
+*   Barometer           10 Hz
 *   GPS                  4 Hz
 *   Battery/continuity   10 Hz
-*
-* The ADXL372 itself remains configured at 3200 Hz ODR. This first SD logger
-* polls it at 500 Hz. FIFO capture can be added later without changing the
-* overall file/session organization.
 */
 #define SDLOG_HEADER_MAGIC           0x324C5441UL  /* "ATL2" little-endian */
 #define SDLOG_HEADER_VERSION         2U
