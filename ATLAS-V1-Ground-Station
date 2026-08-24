@@ -1,0 +1,2057 @@
+#include "stm32f4xx_hal.h"
+#include "fatfs.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+SPI_HandleTypeDef hspi3;
+UART_HandleTypeDef huart4;
+SD_HandleTypeDef hsd;
+
+static FIL at2_log_file;
+static uint8_t at2_sd_ok = 0;
+static uint32_t at2_sd_lines = 0;
+static uint32_t at2_sd_fail = 0;
+static uint16_t GS_BatteryADC_ReadRaw(void);
+static uint32_t GS_ReadBatteryMillivolts(void);
+static char esp_rx_line[64];
+static uint8_t esp_rx_index = 0;
+
+static char flash_status[24] = "READY";
+static uint8_t flash_clear_pending = 0;
+
+#define LED1_PORT GPIOE
+#define LED1_PIN  GPIO_PIN_1
+
+#define LED2_PORT GPIOB
+#define LED2_PIN  GPIO_PIN_12
+
+#define LORA_DEFAULT_FREQUENCY_HZ 915000000UL
+
+static uint32_t current_lora_frequency_hz =
+    LORA_DEFAULT_FREQUENCY_HZ;
+
+static uint32_t pending_lora_frequency_hz = 0;
+
+static uint8_t frequency_change_pending = 0;
+
+/*
+ * MAIN deployment altitude control.
+ *
+ * 0 means the GS has not yet learned the active value from ATLAS V2.
+ * ATLAS V2 is the source of truth because the value is persisted onboard.
+ */
+#define MAIN_ALTITUDE_MIN_FT            100UL
+#define MAIN_ALTITUDE_MAX_FT          10000UL
+#define MAIN_ALTITUDE_ACK_TIMEOUT_MS   4000UL
+
+static uint32_t current_main_altitude_ft = 0;
+static uint32_t main_altitude_command_ms = 0;
+static uint8_t main_altitude_change_pending = 0;
+
+static uint8_t GS_WaitForFrequencyAck(
+    uint32_t timeout_ms
+);
+
+static int16_t last_lora_rssi = 0;
+static float last_lora_snr = 0.0f;
+
+#define LORA_CS_PORT   GPIOE
+#define LORA_CS_PIN    GPIO_PIN_4
+
+#define LORA_RST_PORT  GPIOE
+#define LORA_RST_PIN   GPIO_PIN_5
+
+#define LORA_DIO0_PORT GPIOE
+#define LORA_DIO0_PIN  GPIO_PIN_3
+
+#define REG_FIFO                 0x00
+#define REG_OP_MODE              0x01
+#define REG_FRF_MSB              0x06
+#define REG_FRF_MID              0x07
+#define REG_FRF_LSB              0x08
+#define REG_PA_CONFIG            0x09
+#define REG_OCP                  0x0B
+#define REG_LNA                  0x0C
+#define REG_FIFO_ADDR_PTR        0x0D
+#define REG_FIFO_TX_BASE_ADDR    0x0E
+#define REG_FIFO_RX_BASE_ADDR    0x0F
+#define REG_FIFO_RX_CURRENT_ADDR 0x10
+#define REG_IRQ_FLAGS            0x12
+#define REG_RX_NB_BYTES          0x13
+#define REG_PKT_SNR_VALUE        0x19
+#define REG_PKT_RSSI_VALUE       0x1A
+#define REG_MODEM_CONFIG_1       0x1D
+#define REG_MODEM_CONFIG_2       0x1E
+#define REG_PREAMBLE_MSB         0x20
+#define REG_PREAMBLE_LSB         0x21
+#define REG_PAYLOAD_LENGTH       0x22
+#define REG_MODEM_CONFIG_3       0x26
+#define REG_SYNC_WORD            0x39
+#define REG_DIO_MAPPING_1        0x40
+#define REG_VERSION              0x42
+#define REG_PA_DAC               0x4D
+
+#define MODE_LONG_RANGE_MODE     0x80
+#define MODE_SLEEP               0x00
+#define MODE_STDBY               0x01
+#define MODE_TX                  0x03
+#define MODE_RX_CONTINUOUS       0x05
+
+#define IRQ_TX_DONE_MASK         0x08
+#define IRQ_PAYLOAD_CRC_ERROR    0x20
+#define IRQ_RX_DONE_MASK         0x40
+
+#define GS_BAT_R_TOP_OHMS        240000UL
+#define GS_BAT_R_BOTTOM_OHMS     100000UL
+
+#define GS_BAT_ADC_REFERENCE_MV    3300UL
+#define GS_BAT_ADC_MAX_COUNT       4095UL
+#define GS_BAT_ADC_SAMPLES           32UL
+
+static void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_SPI3_Init(void);
+static void MX_UART4_Init(void);
+void Error_Handler(void);
+static void ESP_ReadCommands(void);
+static void ESP_HandleCommand(const char *command);
+static void GS_SendFlashStatus(const char *status);
+static uint8_t GS_SendFlashClearCommand(void);
+
+static uint8_t GS_FrequencyAllowed(uint32_t frequency_hz);
+
+static void GS_SendFrequencyStatus(
+    const char *status,
+    uint32_t frequency_hz
+);
+
+static uint8_t GS_SendFrequencyCommand(
+    uint32_t frequency_hz
+);
+
+static uint8_t GS_MainAltitudeAllowed(
+    uint32_t altitude_ft
+);
+
+static void GS_SendMainAltitudeStatus(
+    const char *status,
+    uint32_t altitude_ft
+);
+
+static uint8_t GS_SendMainAltitudeCommand(
+    uint32_t altitude_ft
+);
+
+static uint8_t GS_SendHealthQuery(void);
+static void GS_ServiceMainAltitudeCommand(void);
+
+static void LED_Blink(GPIO_TypeDef *port, uint16_t pin, uint8_t times, uint16_t delay_ms);
+
+static void LORA_Select(void);
+static void LORA_Unselect(void);
+static void LORA_Reset(void);
+static void LORA_SetFrequency(uint32_t frequency_hz);
+static uint8_t LORA_ReadReg(uint8_t addr);
+static void LORA_WriteReg(uint8_t addr, uint8_t value);
+static void LORA_WriteFIFO(uint8_t value);
+static uint8_t LORA_Init(void);
+static void LORA_Standby(void);
+static void LORA_RxContinuous(void);
+static uint8_t LORA_Send(uint8_t *data, uint8_t len, uint32_t timeout_ms);
+static uint8_t LORA_ReadPacket(uint8_t *buf, uint8_t max_len);
+
+static void ESP_SendLine(const char *line);
+static void MakeDataLine(char *raw, char *out, uint16_t out_size);
+static void GetValue(char *line, const char *key, char *out, uint16_t out_size);
+
+static void MX_SDIO_SD_Init(void);
+static uint8_t AT2_SD_FindNextFile(char *filename, size_t filename_size);
+static void AT2_SD_Init(void);
+static void AT2_SD_LogPacket(const char *raw, const char *esp_line);
+static void AT2_SD_WriteQuoted(const char *s);
+
+static void GS_BatteryADC_Init(void);
+static void GS_FormatBatteryVoltage(char *out, uint16_t out_size);
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_SPI3_Init();
+    MX_UART4_Init();
+    MX_SDIO_SD_Init();
+    MX_FATFS_Init();
+    AT2_SD_Init();
+    MX_GPIO_Init();
+    GS_BatteryADC_Init();
+    MX_SPI3_Init();
+
+    HAL_GPIO_WritePin(LORA_CS_PORT, LORA_CS_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(LORA_RST_PORT, LORA_RST_PIN, GPIO_PIN_SET);
+
+    LED_Blink(LED1_PORT, LED1_PIN, 5, 80);
+
+    uint8_t lora_ok = LORA_Init();
+
+    if (!lora_ok)
+    {
+        while (1)
+        {
+            LED_Blink(LED2_PORT, LED2_PIN, 3, 120);
+            HAL_Delay(500);
+        }
+    }
+
+    ESP_SendLine("DATA,PKT=0,A1FT=---,A2FT=---,AX=---,AY=---,AZ=---,GX=---,GY=---,GZ=---");
+
+    LORA_RxContinuous();
+
+    uint8_t rx_buf[256];
+    char raw[256];
+    char esp_line[400];
+
+    uint32_t last_gs_battery_send = 0;
+    char gs_battery_value[16];
+    char gs_battery_line[40];
+
+    while (1)
+    {
+    	ESP_ReadCommands();
+        GS_ServiceMainAltitudeCommand();
+
+        if ((HAL_GetTick() - last_gs_battery_send) >= 1000)
+        {
+            last_gs_battery_send = HAL_GetTick();
+
+            GS_FormatBatteryVoltage(
+                gs_battery_value,
+                sizeof(gs_battery_value)
+            );
+
+            snprintf(
+                gs_battery_line,
+                sizeof(gs_battery_line),
+                "GS,GSBATV=%s",
+                gs_battery_value
+            );
+
+            ESP_SendLine(gs_battery_line);
+        }
+
+        uint8_t len = LORA_ReadPacket(
+            rx_buf,
+            sizeof(rx_buf) - 1
+        );
+
+        if (len > 0)
+        {
+            rx_buf[len] = 0;
+
+            strncpy(
+                raw,
+                (char *)rx_buf,
+                sizeof(raw) - 1
+            );
+
+            raw[sizeof(raw) - 1] = 0;
+
+            if (strncmp(raw, "FLASHINFO,", 10) == 0)
+            {
+                char info_line[128];
+
+                snprintf(
+                    info_line,
+                    sizeof(info_line),
+                    "GS,%s",
+                    raw
+                );
+
+                ESP_SendLine(info_line);
+                LORA_RxContinuous();
+                continue;
+            }
+
+            if (strcmp(raw, "FLASHCLEAR_PROGRESS") == 0)
+            {
+                flash_clear_pending = 1;
+                GS_SendFlashStatus("CLEARING");
+                LORA_RxContinuous();
+                continue;
+            }
+
+            if (strcmp(raw, "FLASHVERIFY_STARTED") == 0)
+            {
+                flash_clear_pending = 1;
+                GS_SendFlashStatus("VERIFYING");
+                LORA_RxContinuous();
+                continue;
+            }
+
+            if (strcmp(raw, "FLASHVERIFY_PROGRESS") == 0)
+            {
+                flash_clear_pending = 1;
+                GS_SendFlashStatus("VERIFYING");
+                LORA_RxContinuous();
+                continue;
+            }
+
+            if (strncmp(raw, "FLASHCLEAR_STARTED", 18) == 0)
+            {
+                flash_clear_pending = 1;
+                strncpy(
+                    flash_status,
+                    "CLEARING",
+                    sizeof(flash_status) - 1
+                );
+                flash_status[sizeof(flash_status) - 1] = '\0';
+
+                GS_SendFlashStatus("CLEARING");
+                LORA_RxContinuous();
+                continue;
+            }
+
+            if (strncmp(raw, "FLASHCLEAR_OK", 13) == 0)
+            {
+                flash_clear_pending = 0;
+                strncpy(
+                    flash_status,
+                    "EMPTY",
+                    sizeof(flash_status) - 1
+                );
+                flash_status[sizeof(flash_status) - 1] = '\0';
+
+                /*
+                 * Forward the full proof line from ATLAS V2 to ESP32.
+                 */
+                char proof_line[128];
+
+                snprintf(
+                    proof_line,
+                    sizeof(proof_line),
+                    "GS,FLASHSTATUS=EMPTY,%s",
+                    raw + 14
+                );
+
+                ESP_SendLine(proof_line);
+                LORA_RxContinuous();
+                continue;
+            }
+
+            if (strncmp(raw, "FLASHCLEAR_FAIL", 15) == 0)
+            {
+                flash_clear_pending = 0;
+                strncpy(
+                    flash_status,
+                    "FAILED",
+                    sizeof(flash_status) - 1
+                );
+                flash_status[sizeof(flash_status) - 1] = '\0';
+
+                ESP_SendLine(
+                    "GS,FLASHSTATUS=FAILED,VERIFY=FAIL"
+                );
+
+                LORA_RxContinuous();
+                continue;
+            }
+
+            if (strncmp(raw, "HEALTH,", 7) == 0)
+            {
+                /*
+                 * HEALTH is safe to request at any time and gives the GS the
+                 * active onboard MAIN altitude, including a value restored
+                 * from ATLAS V2 flash after a power cycle.
+                 */
+                char main_alt_text[16];
+
+                GetValue(
+                    raw,
+                    "MAINALTFT",
+                    main_alt_text,
+                    sizeof(main_alt_text)
+                );
+
+                if (main_alt_text[0] != '-' &&
+                    main_alt_text[0] != '\0')
+                {
+                    uint32_t reported_main_altitude_ft =
+                        strtoul(main_alt_text, NULL, 10);
+
+                    if (GS_MainAltitudeAllowed(reported_main_altitude_ft))
+                    {
+                        current_main_altitude_ft =
+                            reported_main_altitude_ft;
+                    }
+                }
+
+                char health_line[160];
+
+                snprintf(
+                    health_line,
+                    sizeof(health_line),
+                    "GS,%s",
+                    raw
+                );
+
+                ESP_SendLine(health_line);
+                LORA_RxContinuous();
+                continue;
+            }
+
+            if (strncmp(raw, "MAINALTACK=", 11) == 0)
+            {
+                char *end_ptr = NULL;
+
+                uint32_t confirmed_altitude_ft =
+                    strtoul(
+                        raw + 11,
+                        &end_ptr,
+                        10
+                    );
+
+                if (
+                    end_ptr != (raw + 11) &&
+                    *end_ptr == '\0' &&
+                    GS_MainAltitudeAllowed(confirmed_altitude_ft)
+                )
+                {
+                    current_main_altitude_ft =
+                        confirmed_altitude_ft;
+
+                    main_altitude_change_pending = 0;
+                    main_altitude_command_ms = 0;
+
+                    GS_SendMainAltitudeStatus(
+                        "CHANGED",
+                        current_main_altitude_ft
+                    );
+                }
+                else
+                {
+                    main_altitude_change_pending = 0;
+                    main_altitude_command_ms = 0;
+
+                    GS_SendMainAltitudeStatus(
+                        "BAD_ACK",
+                        current_main_altitude_ft
+                    );
+                }
+
+                LORA_RxContinuous();
+                continue;
+            }
+
+            if (strncmp(raw, "MAINALTNAK", 10) == 0)
+            {
+                main_altitude_change_pending = 0;
+                main_altitude_command_ms = 0;
+
+                GS_SendMainAltitudeStatus(
+                    "REJECTED",
+                    current_main_altitude_ft
+                );
+
+                LORA_RxContinuous();
+                continue;
+            }
+
+            if (strncmp(raw, "AT1,", 4) == 0)
+            {
+                MakeDataLine(
+                    raw,
+                    esp_line,
+                    sizeof(esp_line)
+                );
+
+                if (frequency_change_pending)
+                {
+                    uint32_t new_frequency_hz =
+                        pending_lora_frequency_hz;
+
+                    if (
+                        GS_SendFrequencyCommand(
+                            new_frequency_hz
+                        )
+                    )
+                    {
+                        GS_SendFrequencyStatus(
+                            "COMMAND_SENT",
+                            new_frequency_hz
+                        );
+
+                        if (
+                        	GS_WaitForFrequencyAck(3000)
+                        )
+                        {
+                            /*
+                             * The onboard radio confirmed
+                             * the command on the old frequency.
+                             */
+                            LORA_Standby();
+
+                            LORA_SetFrequency(
+                                new_frequency_hz
+                            );
+
+                            current_lora_frequency_hz =
+                                new_frequency_hz;
+
+                            pending_lora_frequency_hz = 0;
+                            frequency_change_pending = 0;
+
+                            GS_SendFrequencyStatus(
+                                "CHANGED",
+                                current_lora_frequency_hz
+                            );
+                        }
+                        else
+                        {
+                            GS_SendFrequencyStatus(
+                                "NO_ACK",
+                                current_lora_frequency_hz
+                            );
+
+                            pending_lora_frequency_hz = 0;
+                            frequency_change_pending = 0;
+
+                            LORA_RxContinuous();
+                        }
+                    }
+                    else
+                    {
+                        GS_SendFrequencyStatus(
+                            "SEND_FAILED",
+                            current_lora_frequency_hz
+                        );
+
+                        pending_lora_frequency_hz = 0;
+                        frequency_change_pending = 0;
+
+                        LORA_RxContinuous();
+                    }
+                }
+                else
+                {
+                    char ack[40];
+                    char pkt[20];
+
+                    GetValue(
+                        raw,
+                        "PKT",
+                        pkt,
+                        sizeof(pkt)
+                    );
+
+                    snprintf(
+                        ack,
+                        sizeof(ack),
+                        "ACK,PKT=%s",
+                        pkt
+                    );
+
+                    LORA_Send(
+                        (uint8_t *)ack,
+                        strlen(ack),
+                        1000
+                    );
+                }
+
+                ESP_SendLine(esp_line);
+
+                LED_Blink(
+                    LED2_PORT,
+                    LED2_PIN,
+                    2,
+                    60
+                );
+
+                HAL_GPIO_TogglePin(
+                    LED1_PORT,
+                    LED1_PIN
+                );
+
+                AT2_SD_LogPacket(
+                    raw,
+                    esp_line
+                );
+            }
+
+            LORA_RxContinuous();
+        }
+    }
+}
+
+static void GS_BatteryADC_Init(void)
+{
+    /*
+     * Enable ADC1 clock.
+     */
+    __HAL_RCC_ADC1_CLK_ENABLE();
+
+    /*
+     * ADC clock = PCLK2 divided by 4.
+     */
+    ADC->CCR &= ~(3UL << 16);
+    ADC->CCR |=  (1UL << 16);
+
+    /*
+     * Reset ADC1 settings.
+     */
+    ADC1->CR1 = 0;
+    ADC1->CR2 = 0;
+
+    /*
+     * One regular conversion.
+     */
+    ADC1->SQR1 = 0;
+
+    /*
+     * PC2 is ADC channel 12.
+     */
+    ADC1->SQR3 = 12;
+
+    /*
+     * Channel 12 sampling time = 480 cycles.
+     */
+    ADC1->SMPR1 &= ~(7UL << 6);
+    ADC1->SMPR1 |=  (7UL << 6);
+
+    /*
+     * Turn ADC1 on.
+     */
+    ADC1->CR2 |= ADC_CR2_ADON;
+
+    HAL_Delay(2);
+}
+
+static uint16_t GS_BatteryADC_ReadRaw(void)
+{
+    uint32_t start_time = HAL_GetTick();
+
+    /*
+     * Clear old ADC status flags.
+     */
+    ADC1->SR = 0;
+
+    /*
+     * Start one ADC conversion.
+     */
+    ADC1->CR2 |= ADC_CR2_SWSTART;
+
+    /*
+     * Wait for the conversion to finish.
+     */
+    while ((ADC1->SR & ADC_SR_EOC) == 0)
+    {
+        if ((HAL_GetTick() - start_time) > 10)
+        {
+            return 0;
+        }
+    }
+
+    /*
+     * Reading DR clears the EOC flag.
+     */
+    return (uint16_t)ADC1->DR;
+}
+
+static uint32_t GS_ReadBatteryMillivolts(void)
+{
+    uint32_t raw_sum = 0;
+
+    for (uint32_t i = 0; i < GS_BAT_ADC_SAMPLES; i++)
+    {
+        raw_sum += GS_BatteryADC_ReadRaw();
+    }
+
+    uint32_t average_raw =
+        raw_sum / GS_BAT_ADC_SAMPLES;
+
+    uint64_t battery_millivolts =
+        (uint64_t)average_raw *
+        GS_BAT_ADC_REFERENCE_MV *
+        (GS_BAT_R_TOP_OHMS + GS_BAT_R_BOTTOM_OHMS);
+
+    battery_millivolts /=
+        (uint64_t)GS_BAT_ADC_MAX_COUNT *
+        GS_BAT_R_BOTTOM_OHMS;
+
+    return (uint32_t)battery_millivolts;
+}
+
+static void GS_FormatBatteryVoltage(char *out, uint16_t out_size)
+{
+    uint32_t battery_millivolts =
+        GS_ReadBatteryMillivolts();
+
+    uint32_t whole_volts =
+        battery_millivolts / 1000UL;
+
+    uint32_t hundredths =
+        (battery_millivolts % 1000UL) / 10UL;
+
+    snprintf(
+        out,
+        out_size,
+        "%lu.%02lu",
+        (unsigned long)whole_volts,
+        (unsigned long)hundredths
+    );
+}
+
+static void MakeDataLine(char *raw, char *out, uint16_t out_size)
+{
+    char pkt[20];
+    char a1ft[20];
+    char descfts[20];
+    char mach[16];
+    char ax[20];
+    char ay[20];
+    char az[20];
+    char gx[20];
+    char gy[20];
+    char gz[20];
+    char i1[12];
+    char i2[12];
+    char gps_status[12];
+    char gps_fix[12];
+    char sats[12];
+    char lat[24];
+    char lon[24];
+    char gps_age[20];
+    char gps_alt_ft[20];
+    char gps_vs_fts[20];
+    char radio_frequency_hz[20];
+
+    char onboard_battery[16];
+    char gs_battery[16];
+
+    GetValue(raw, "PKT", pkt, sizeof(pkt));
+    GetValue(raw, "A1FT", a1ft, sizeof(a1ft));
+    GetValue(raw, "DESCFTS", descfts, sizeof(descfts));
+    GetValue(raw, "MACH", mach, sizeof(mach));
+    GetValue(raw, "AX", ax, sizeof(ax));
+    GetValue(raw, "AY", ay, sizeof(ay));
+    GetValue(raw, "AZ", az, sizeof(az));
+    GetValue(raw, "GX", gx, sizeof(gx));
+    GetValue(raw, "GY", gy, sizeof(gy));
+    GetValue(raw, "GZ", gz, sizeof(gz));
+    GetValue(raw, "I1", i1, sizeof(i1));
+    GetValue(raw, "I2", i2, sizeof(i2));
+    GetValue(raw, "GPS", gps_status, sizeof(gps_status));
+    GetValue(raw, "FIX", gps_fix, sizeof(gps_fix));
+    GetValue(raw, "SATS", sats, sizeof(sats));
+    GetValue(raw, "LAT", lat, sizeof(lat));
+    GetValue(raw, "LON", lon, sizeof(lon));
+    GetValue(raw, "GPSAGE", gps_age, sizeof(gps_age));
+    GetValue(raw, "GPSALTFT", gps_alt_ft, sizeof(gps_alt_ft));
+    GetValue(raw, "GPSVSFTS", gps_vs_fts, sizeof(gps_vs_fts));
+
+    GetValue(
+        raw,
+        "RFHZ",
+        radio_frequency_hz,
+        sizeof(radio_frequency_hz)
+    );
+
+    GetValue(
+        raw,
+        "BATV",
+        onboard_battery,
+        sizeof(onboard_battery)
+    );
+
+    GS_FormatBatteryVoltage(
+        gs_battery,
+        sizeof(gs_battery)
+    );
+
+    snprintf(
+        out,
+        out_size,
+        "DATA,PKT=%s,A1FT=%s,A2FT=0.0,DESCFTS=%s,MACH=%s,"
+        "AX=%s,AY=%s,AZ=%s,"
+        "GX=%s,GY=%s,GZ=%s,"
+        "I1=%s,I2=%s,GPS=%s,FIX=%s,SATS=%s,"
+        "LAT=%s,LON=%s,GPSAGE=%s,GPSALTFT=%s,GPSVSFTS=%s,"
+        "RFHZ=%s,BATV=%s,GSBATV=%s,"
+        "RSSI=%d,SNR=%d.%02d",
+        pkt,
+        a1ft,
+        descfts,
+        mach,
+        ax,
+        ay,
+        az,
+        gx,
+        gy,
+        gz,
+        i1,
+        i2,
+        gps_status,
+        gps_fix,
+        sats,
+        lat,
+        lon,
+        gps_age,
+        gps_alt_ft,
+        gps_vs_fts,
+        radio_frequency_hz,
+        onboard_battery,
+        gs_battery,
+        last_lora_rssi,
+        (int)last_lora_snr,
+        abs((int)(last_lora_snr * 100.0f) % 100)
+    );
+}
+
+static void GetValue(char *line, const char *key, char *out, uint16_t out_size)
+{
+    char search[24];
+
+    snprintf(search, sizeof(search), "%s=", key);
+
+    char *start = strstr(line, search);
+
+    if (start == NULL)
+    {
+        strncpy(out, "---", out_size);
+        out[out_size - 1] = 0;
+        return;
+    }
+
+    start += strlen(search);
+
+    char *end = strchr(start, ',');
+
+    uint16_t len = 0;
+
+    if (end == NULL)
+    {
+        len = strlen(start);
+    }
+    else
+    {
+        len = end - start;
+    }
+
+    if (len >= out_size)
+    {
+        len = out_size - 1;
+    }
+
+    memcpy(out, start, len);
+    out[len] = 0;
+}
+
+static void ESP_SendLine(const char *line)
+{
+    HAL_UART_Transmit(&huart4, (uint8_t *)line, strlen(line), 100);
+    HAL_UART_Transmit(&huart4, (uint8_t *)"\r\n", 2, 100);
+}
+
+static uint8_t LORA_Init(void)
+{
+    LORA_Reset();
+
+    if (LORA_ReadReg(REG_VERSION) != 0x12)
+    {
+        return 0;
+    }
+
+    LORA_WriteReg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_SLEEP);
+    HAL_Delay(10);
+
+    LORA_WriteReg(REG_FIFO_TX_BASE_ADDR, 0x00);
+    LORA_WriteReg(REG_FIFO_RX_BASE_ADDR, 0x00);
+
+    LORA_SetFrequency(current_lora_frequency_hz);
+
+    LORA_WriteReg(REG_PA_CONFIG, 0x8F);
+    LORA_WriteReg(REG_OCP, 0x2B);
+    LORA_WriteReg(REG_LNA, 0x23);
+
+    LORA_WriteReg(REG_MODEM_CONFIG_1, 0x72);
+    LORA_WriteReg(REG_MODEM_CONFIG_2, 0x74);
+    LORA_WriteReg(REG_MODEM_CONFIG_3, 0x04);
+
+    LORA_WriteReg(REG_PREAMBLE_MSB, 0x00);
+    LORA_WriteReg(REG_PREAMBLE_LSB, 0x08);
+
+    LORA_WriteReg(REG_SYNC_WORD, 0x12);
+    LORA_WriteReg(REG_PA_DAC, 0x84);
+    LORA_WriteReg(REG_IRQ_FLAGS, 0xFF);
+
+    LORA_Standby();
+
+    return 1;
+}
+
+static uint8_t GS_FrequencyAllowed(uint32_t frequency_hz)
+{
+    if (
+        frequency_hz >= 902300000UL &&
+        frequency_hz <= 927500000UL
+    )
+    {
+        return 1;
+    }
+
+    return 0;
+}
+
+static void GS_SendFrequencyStatus(
+    const char *status,
+    uint32_t frequency_hz
+)
+{
+    char line[80];
+
+    uint32_t whole_mhz =
+        frequency_hz / 1000000UL;
+
+    uint32_t decimal_mhz =
+        (frequency_hz % 1000000UL) / 100000UL;
+
+    snprintf(
+        line,
+        sizeof(line),
+        "GS,FREQ=%lu.%01lu,FREQSTATUS=%s",
+        (unsigned long)whole_mhz,
+        (unsigned long)decimal_mhz,
+        status
+    );
+
+    ESP_SendLine(line);
+}
+
+static void ESP_ReadCommands(void)
+{
+    uint8_t received_character;
+
+    while (
+        HAL_UART_Receive(
+            &huart4,
+            &received_character,
+            1,
+            1
+        ) == HAL_OK
+    )
+    {
+        if (
+            received_character == '\n' ||
+            received_character == '\r'
+        )
+        {
+            if (esp_rx_index > 0)
+            {
+                esp_rx_line[esp_rx_index] = '\0';
+
+                ESP_HandleCommand(esp_rx_line);
+
+                esp_rx_index = 0;
+            }
+        }
+        else
+        {
+            if (
+                esp_rx_index <
+                sizeof(esp_rx_line) - 1
+            )
+            {
+                esp_rx_line[esp_rx_index++] =
+                    (char)received_character;
+            }
+            else
+            {
+                esp_rx_index = 0;
+            }
+        }
+    }
+}
+
+static void ESP_HandleCommand(const char *command)
+{
+    if (strcmp(command, "FLASHINFO") == 0)
+    {
+        const char query[] = "CMD,FLASHINFO";
+
+        if (!LORA_Send(
+            (uint8_t *)query,
+            (uint8_t)strlen(query),
+            1000
+        ))
+        {
+            ESP_SendLine(
+                "GS,FLASHINFOSTATUS=SEND_FAILED"
+            );
+        }
+
+        LORA_RxContinuous();
+        return;
+    }
+
+    /*
+     * Destructive W25Q128 erase command.
+     * Require the exact confirmation token from the ESP32 UI.
+     */
+    if (
+        strcmp(
+            command,
+            "CLEARFLASH,CONFIRM=ERASE_W25Q128"
+        ) == 0
+    )
+    {
+        if (flash_clear_pending)
+        {
+            GS_SendFlashStatus("CLEARING");
+            return;
+        }
+
+        if (GS_SendFlashClearCommand())
+        {
+            flash_clear_pending = 1;
+
+            strncpy(
+                flash_status,
+                "COMMAND_SENT",
+                sizeof(flash_status) - 1
+            );
+            flash_status[sizeof(flash_status) - 1] = '\0';
+
+            GS_SendFlashStatus("COMMAND_SENT");
+
+            LORA_RxContinuous();
+        }
+        else
+        {
+            flash_clear_pending = 0;
+
+            strncpy(
+                flash_status,
+                "SEND_FAILED",
+                sizeof(flash_status) - 1
+            );
+            flash_status[sizeof(flash_status) - 1] = '\0';
+
+            GS_SendFlashStatus("SEND_FAILED");
+
+            LORA_RxContinuous();
+        }
+
+        return;
+    }
+
+    if (strcmp(command, "HEALTH") == 0)
+    {
+        if (!GS_SendHealthQuery())
+        {
+            GS_SendMainAltitudeStatus(
+                "HEALTH_SEND_FAILED",
+                current_main_altitude_ft
+            );
+        }
+
+        LORA_RxContinuous();
+        return;
+    }
+
+    if (strncmp(command, "SETMAINALT,", 11) == 0)
+    {
+        char *end_ptr = NULL;
+
+        uint32_t requested_main_altitude_ft =
+            strtoul(
+                command + 11,
+                &end_ptr,
+                10
+            );
+
+        if (
+            end_ptr == (command + 11) ||
+            *end_ptr != '\0' ||
+            !GS_MainAltitudeAllowed(requested_main_altitude_ft)
+        )
+        {
+            GS_SendMainAltitudeStatus(
+                "INVALID",
+                current_main_altitude_ft
+            );
+
+            return;
+        }
+
+        if (main_altitude_change_pending)
+        {
+            GS_SendMainAltitudeStatus(
+                "BUSY",
+                current_main_altitude_ft
+            );
+
+            return;
+        }
+
+        if (
+            current_main_altitude_ft != 0 &&
+            requested_main_altitude_ft ==
+                current_main_altitude_ft
+        )
+        {
+            GS_SendMainAltitudeStatus(
+                "ALREADY_SET",
+                current_main_altitude_ft
+            );
+
+            return;
+        }
+
+        if (
+            GS_SendMainAltitudeCommand(
+                requested_main_altitude_ft
+            )
+        )
+        {
+            main_altitude_change_pending = 1;
+            main_altitude_command_ms = HAL_GetTick();
+
+            GS_SendMainAltitudeStatus(
+                "COMMAND_SENT",
+                current_main_altitude_ft
+            );
+
+            LORA_RxContinuous();
+        }
+        else
+        {
+            main_altitude_change_pending = 0;
+            main_altitude_command_ms = 0;
+
+            GS_SendMainAltitudeStatus(
+                "SEND_FAILED",
+                current_main_altitude_ft
+            );
+
+            LORA_RxContinuous();
+        }
+
+        return;
+    }
+
+    if (strncmp(command, "SETFREQ,", 8) != 0)
+    {
+        return;
+    }
+
+    uint32_t requested_frequency_hz =
+        strtoul(
+            command + 8,
+            NULL,
+            10
+        );
+
+    if (!GS_FrequencyAllowed(requested_frequency_hz))
+    {
+        GS_SendFrequencyStatus(
+            "INVALID",
+            current_lora_frequency_hz
+        );
+
+        return;
+    }
+
+    if (
+        requested_frequency_hz ==
+        current_lora_frequency_hz
+    )
+    {
+        GS_SendFrequencyStatus(
+            "ALREADY_SET",
+            current_lora_frequency_hz
+        );
+
+        return;
+    }
+
+    /*
+     * Send the frequency command IMMEDIATELY.
+     *
+     * Older code queued the request and waited for the next AT1 telemetry
+     * packet before sending CMD,FREQ. That made frequency changes depend on
+     * normal telemetry timing and could fail after a long flash erase.
+     *
+     * Frequency changing is now independent of telemetry packets.
+     */
+    pending_lora_frequency_hz =
+        requested_frequency_hz;
+
+    frequency_change_pending = 0;
+
+    if (
+        GS_SendFrequencyCommand(
+            requested_frequency_hz
+        )
+    )
+    {
+        GS_SendFrequencyStatus(
+            "COMMAND_SENT",
+            requested_frequency_hz
+        );
+
+        if (
+            GS_WaitForFrequencyAck(3000)
+        )
+        {
+            /*
+             * ATLAS V2 acknowledged on the OLD frequency.
+             * Now retune ATLAS V1 to the requested frequency.
+             */
+            LORA_Standby();
+
+            LORA_SetFrequency(
+                requested_frequency_hz
+            );
+
+            current_lora_frequency_hz =
+                requested_frequency_hz;
+
+            pending_lora_frequency_hz = 0;
+
+            GS_SendFrequencyStatus(
+                "CHANGED",
+                current_lora_frequency_hz
+            );
+
+            LORA_RxContinuous();
+        }
+        else
+        {
+            /*
+             * Do NOT retune if V2 never acknowledged.
+             * Stay on the current frequency so the link is preserved.
+             */
+            pending_lora_frequency_hz = 0;
+
+            GS_SendFrequencyStatus(
+                "NO_ACK",
+                current_lora_frequency_hz
+            );
+
+            LORA_RxContinuous();
+        }
+    }
+    else
+    {
+        pending_lora_frequency_hz = 0;
+
+        GS_SendFrequencyStatus(
+            "SEND_FAILED",
+            current_lora_frequency_hz
+        );
+
+        LORA_RxContinuous();
+    }
+}
+
+static uint8_t GS_MainAltitudeAllowed(
+    uint32_t altitude_ft
+)
+{
+    return (
+        altitude_ft >= MAIN_ALTITUDE_MIN_FT &&
+        altitude_ft <= MAIN_ALTITUDE_MAX_FT
+    );
+}
+
+static void GS_SendMainAltitudeStatus(
+    const char *status,
+    uint32_t altitude_ft
+)
+{
+    char line[96];
+
+    if (altitude_ft != 0)
+    {
+        snprintf(
+            line,
+            sizeof(line),
+            "GS,MAINALTFT=%lu,MAINALTSTATUS=%s",
+            (unsigned long)altitude_ft,
+            status
+        );
+    }
+    else
+    {
+        snprintf(
+            line,
+            sizeof(line),
+            "GS,MAINALTFT=UNKNOWN,MAINALTSTATUS=%s",
+            status
+        );
+    }
+
+    ESP_SendLine(line);
+}
+
+static uint8_t GS_SendMainAltitudeCommand(
+    uint32_t altitude_ft
+)
+{
+    char command[48];
+
+    snprintf(
+        command,
+        sizeof(command),
+        "CMD,MAINALTFT=%lu",
+        (unsigned long)altitude_ft
+    );
+
+    return LORA_Send(
+        (uint8_t *)command,
+        (uint8_t)strlen(command),
+        1000
+    );
+}
+
+static uint8_t GS_SendHealthQuery(void)
+{
+    const char command[] =
+        "CMD,HEALTH";
+
+    return LORA_Send(
+        (uint8_t *)command,
+        (uint8_t)strlen(command),
+        1000
+    );
+}
+
+static void GS_ServiceMainAltitudeCommand(void)
+{
+    if (!main_altitude_change_pending)
+    {
+        return;
+    }
+
+    if (
+        (HAL_GetTick() - main_altitude_command_ms) >=
+        MAIN_ALTITUDE_ACK_TIMEOUT_MS
+    )
+    {
+        main_altitude_change_pending = 0;
+        main_altitude_command_ms = 0;
+
+        GS_SendMainAltitudeStatus(
+            "NO_ACK",
+            current_main_altitude_ft
+        );
+
+        LORA_RxContinuous();
+    }
+}
+
+static void GS_SendFlashStatus(const char *status)
+{
+    char line[64];
+
+    snprintf(
+        line,
+        sizeof(line),
+        "GS,FLASHSTATUS=%s",
+        status
+    );
+
+    ESP_SendLine(line);
+}
+
+static uint8_t GS_SendFlashClearCommand(void)
+{
+    const char command[] =
+        "CMD,FLASHCLEAR,CONFIRM=ERASE_W25Q128";
+
+    return LORA_Send(
+        (uint8_t *)command,
+        (uint8_t)strlen(command),
+        1000
+    );
+}
+
+static uint8_t GS_SendFrequencyCommand(
+    uint32_t frequency_hz
+)
+{
+    char command[48];
+
+    snprintf(
+        command,
+        sizeof(command),
+        "CMD,FREQ=%lu",
+        (unsigned long)frequency_hz
+    );
+
+    return LORA_Send(
+        (uint8_t *)command,
+        strlen(command),
+        1000
+    );
+}
+
+static uint8_t GS_WaitForFrequencyAck(
+    uint32_t timeout_ms
+)
+{
+    uint8_t buffer[64];
+    uint32_t start_time = HAL_GetTick();
+
+    LORA_RxContinuous();
+
+    while (
+        (HAL_GetTick() - start_time) <
+        timeout_ms
+    )
+    {
+        uint8_t length =
+            LORA_ReadPacket(
+                buffer,
+                sizeof(buffer) - 1
+            );
+
+        if (length > 0)
+        {
+            buffer[length] = '\0';
+
+            if (
+                strcmp(
+                    (char *)buffer,
+                    "FREQACK"
+                ) == 0
+            )
+            {
+                LORA_Standby();
+                return 1;
+            }
+        }
+    }
+
+    LORA_Standby();
+
+    return 0;
+}
+
+static void LORA_SetFrequency(uint32_t frequency_hz)
+{
+    uint64_t frf;
+
+    frf = (((uint64_t)frequency_hz << 19) + 16000000ULL)
+          / 32000000ULL;
+
+    LORA_WriteReg(REG_FRF_MSB, (uint8_t)(frf >> 16));
+    LORA_WriteReg(REG_FRF_MID, (uint8_t)(frf >> 8));
+    LORA_WriteReg(REG_FRF_LSB, (uint8_t)frf);
+}
+
+static void LORA_Standby(void)
+{
+    LORA_WriteReg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_STDBY);
+}
+
+static void LORA_RxContinuous(void)
+{
+    LORA_Standby();
+    LORA_WriteReg(REG_DIO_MAPPING_1, 0x00);
+    LORA_WriteReg(REG_IRQ_FLAGS, 0xFF);
+    LORA_WriteReg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_RX_CONTINUOUS);
+}
+
+static uint8_t LORA_Send(uint8_t *data, uint8_t len, uint32_t timeout_ms)
+{
+    uint32_t start = HAL_GetTick();
+
+    LORA_Standby();
+    LORA_WriteReg(REG_DIO_MAPPING_1, 0x40);
+    LORA_WriteReg(REG_IRQ_FLAGS, 0xFF);
+    LORA_WriteReg(REG_FIFO_ADDR_PTR, 0x00);
+
+    for (uint8_t i = 0; i < len; i++)
+    {
+        LORA_WriteFIFO(data[i]);
+    }
+
+    LORA_WriteReg(REG_PAYLOAD_LENGTH, len);
+    LORA_WriteReg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_TX);
+
+    while ((HAL_GetTick() - start) < timeout_ms)
+    {
+        uint8_t irq = LORA_ReadReg(REG_IRQ_FLAGS);
+
+        if (irq & IRQ_TX_DONE_MASK)
+        {
+            LORA_WriteReg(REG_IRQ_FLAGS, IRQ_TX_DONE_MASK);
+            LORA_Standby();
+            return 1;
+        }
+    }
+
+    LORA_Standby();
+    return 0;
+}
+
+static uint8_t LORA_ReadPacket(uint8_t *buf, uint8_t max_len)
+{
+    uint8_t irq = LORA_ReadReg(REG_IRQ_FLAGS);
+
+    if (!(irq & IRQ_RX_DONE_MASK))
+    {
+        return 0;
+    }
+
+    LORA_WriteReg(REG_IRQ_FLAGS, 0xFF);
+
+    if (irq & IRQ_PAYLOAD_CRC_ERROR)
+    {
+        return 0;
+    }
+
+    uint8_t len = LORA_ReadReg(REG_RX_NB_BYTES);
+    uint8_t current_addr = LORA_ReadReg(REG_FIFO_RX_CURRENT_ADDR);
+
+    int8_t raw_snr =
+        (int8_t)LORA_ReadReg(REG_PKT_SNR_VALUE);
+
+    last_lora_snr =
+        ((float)raw_snr) / 4.0f;
+
+    uint8_t raw_rssi =
+        LORA_ReadReg(REG_PKT_RSSI_VALUE);
+
+    last_lora_rssi =
+        -157 + raw_rssi;
+    if (len > max_len)
+    {
+        len = max_len;
+    }
+
+    LORA_WriteReg(REG_FIFO_ADDR_PTR, current_addr);
+
+    for (uint8_t i = 0; i < len; i++)
+    {
+        buf[i] = LORA_ReadReg(REG_FIFO);
+    }
+
+    return len;
+}
+
+static void LORA_Reset(void)
+{
+    HAL_GPIO_WritePin(LORA_RST_PORT, LORA_RST_PIN, GPIO_PIN_RESET);
+    HAL_Delay(20);
+    HAL_GPIO_WritePin(LORA_RST_PORT, LORA_RST_PIN, GPIO_PIN_SET);
+    HAL_Delay(50);
+}
+
+static void LORA_Select(void)
+{
+    HAL_GPIO_WritePin(LORA_CS_PORT, LORA_CS_PIN, GPIO_PIN_RESET);
+}
+
+static void LORA_Unselect(void)
+{
+    HAL_GPIO_WritePin(LORA_CS_PORT, LORA_CS_PIN, GPIO_PIN_SET);
+}
+
+static uint8_t LORA_ReadReg(uint8_t addr)
+{
+    uint8_t tx[2] = {addr & 0x7F, 0x00};
+    uint8_t rx[2] = {0};
+
+    LORA_Select();
+    HAL_SPI_TransmitReceive(&hspi3, tx, rx, 2, 100);
+    LORA_Unselect();
+
+    return rx[1];
+}
+
+static void LORA_WriteReg(uint8_t addr, uint8_t value)
+{
+    uint8_t tx[2] = {addr | 0x80, value};
+
+    LORA_Select();
+    HAL_SPI_Transmit(&hspi3, tx, 2, 100);
+    LORA_Unselect();
+}
+
+static void LORA_WriteFIFO(uint8_t value)
+{
+    LORA_WriteReg(REG_FIFO, value);
+}
+
+static void LED_Blink(GPIO_TypeDef *port, uint16_t pin, uint8_t times, uint16_t delay_ms)
+{
+    for (uint8_t i = 0; i < times; i++)
+    {
+        HAL_GPIO_WritePin(port, pin, GPIO_PIN_SET);
+        HAL_Delay(delay_ms);
+        HAL_GPIO_WritePin(port, pin, GPIO_PIN_RESET);
+        HAL_Delay(delay_ms);
+    }
+}
+/*
+ * Find the next unused ground-station log file.
+ *
+ * Every ATLAS V1 power-up gets its own file:
+ *
+ *   GS0001.CSV
+ *   GS0002.CSV
+ *   GS0003.CSV
+ *   ...
+ *
+ * Existing files are never overwritten.
+ */
+static uint8_t AT2_SD_FindNextFile(
+    char *filename,
+    size_t filename_size
+)
+{
+    if (!filename || filename_size < 11U)
+    {
+        return 0;
+    }
+
+    DIR directory;
+    FILINFO info;
+
+    FRESULT result =
+        f_opendir(
+            &directory,
+            SDPath
+        );
+
+    if (result != FR_OK)
+    {
+        return 0;
+    }
+
+    uint32_t highest = 0;
+
+    while (1)
+    {
+        result =
+            f_readdir(
+                &directory,
+                &info
+            );
+
+        if (result != FR_OK)
+        {
+            f_closedir(&directory);
+            return 0;
+        }
+
+        if (info.fname[0] == '\0')
+        {
+            break;
+        }
+
+        /*
+         * Accept only:
+         * GS0001.CSV through GS9999.CSV
+         */
+        if (
+            strlen(info.fname) == 10U &&
+            info.fname[0] == 'G' &&
+            info.fname[1] == 'S' &&
+            info.fname[6] == '.' &&
+            info.fname[7] == 'C' &&
+            info.fname[8] == 'S' &&
+            info.fname[9] == 'V'
+        )
+        {
+            uint32_t number = 0;
+            uint8_t valid = 1;
+
+            for (uint8_t i = 2; i <= 5; i++)
+            {
+                if (
+                    info.fname[i] < '0' ||
+                    info.fname[i] > '9'
+                )
+                {
+                    valid = 0;
+                    break;
+                }
+
+                number =
+                    (number * 10UL) +
+                    (uint32_t)(
+                        info.fname[i] - '0'
+                    );
+            }
+
+            if (
+                valid &&
+                number > highest
+            )
+            {
+                highest = number;
+            }
+        }
+    }
+
+    f_closedir(&directory);
+
+    if (highest >= 9999UL)
+    {
+        return 0;
+    }
+
+    uint32_t next_number =
+        highest + 1UL;
+
+    snprintf(
+        filename,
+        filename_size,
+        "GS%04lu.CSV",
+        (unsigned long)next_number
+    );
+
+    return 1;
+}
+
+static void AT2_SD_Init(void)
+{
+    FRESULT res;
+    UINT bw = 0;
+
+    at2_sd_ok = 0;
+    at2_sd_lines = 0;
+    at2_sd_fail = 0;
+
+    res =
+        f_mount(
+            &SDFatFS,
+            (TCHAR const *)SDPath,
+            1
+        );
+
+    if (res != FR_OK)
+    {
+        at2_sd_fail++;
+        return;
+    }
+
+    char filename[16];
+
+    if (
+        !AT2_SD_FindNextFile(
+            filename,
+            sizeof(filename)
+        )
+    )
+    {
+        at2_sd_fail++;
+        return;
+    }
+
+    /*
+     * FA_CREATE_NEW is intentional.
+     * Even if the file scan somehow fails/races,
+     * an existing ground-station log can never be overwritten.
+     */
+    res =
+        f_open(
+            &at2_log_file,
+            filename,
+            FA_CREATE_NEW | FA_WRITE
+        );
+
+    if (res != FR_OK)
+    {
+        at2_sd_fail++;
+        return;
+    }
+
+    const char *header =
+        "ms,raw_at1_packet,esp32_line\r\n";
+
+    res =
+        f_write(
+            &at2_log_file,
+            header,
+            strlen(header),
+            &bw
+        );
+
+    if (
+        res != FR_OK ||
+        bw != strlen(header)
+    )
+    {
+        at2_sd_fail++;
+        f_close(&at2_log_file);
+        return;
+    }
+
+    /*
+     * Commit the new file + header immediately.
+     */
+    if (f_sync(&at2_log_file) != FR_OK)
+    {
+        at2_sd_fail++;
+        f_close(&at2_log_file);
+        return;
+    }
+
+    at2_sd_ok = 1;
+}
+
+static void AT2_SD_WriteQuoted(const char *s)
+{
+    UINT bw = 0;
+
+    f_write(&at2_log_file, "\"", 1, &bw);
+
+    while (*s)
+    {
+        if (*s == '"')
+        {
+            f_write(&at2_log_file, "\"\"", 2, &bw);
+        }
+        else
+        {
+            f_write(&at2_log_file, s, 1, &bw);
+        }
+
+        s++;
+    }
+
+    f_write(&at2_log_file, "\"", 1, &bw);
+}
+
+static void AT2_SD_LogPacket(const char *raw, const char *esp_line)
+{
+    if (!at2_sd_ok)
+    {
+        return;
+    }
+
+    FRESULT res;
+    UINT bw = 0;
+    char start[32];
+
+    snprintf(start, sizeof(start), "%lu,", (unsigned long)HAL_GetTick());
+
+    res = f_write(&at2_log_file, start, strlen(start), &bw);
+
+    if (res != FR_OK)
+    {
+        at2_sd_ok = 0;
+        at2_sd_fail++;
+        return;
+    }
+
+    AT2_SD_WriteQuoted(raw);
+
+    res = f_write(&at2_log_file, ",", 1, &bw);
+
+    if (res != FR_OK)
+    {
+        at2_sd_ok = 0;
+        at2_sd_fail++;
+        return;
+    }
+
+    AT2_SD_WriteQuoted(esp_line);
+
+    res = f_write(&at2_log_file, "\r\n", 2, &bw);
+
+    if (res != FR_OK)
+    {
+        at2_sd_ok = 0;
+        at2_sd_fail++;
+        return;
+    }
+
+    at2_sd_lines++;
+
+    f_sync(&at2_log_file);
+}
+static void MX_SDIO_SD_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOD_CLK_ENABLE();
+    __HAL_RCC_SDIO_CLK_ENABLE();
+
+    GPIO_InitStruct.Pin = GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_11 | GPIO_PIN_12;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF12_SDIO;
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_2;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF12_SDIO;
+    HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+    hsd.Instance = SDIO;
+    hsd.Init.ClockEdge = SDIO_CLOCK_EDGE_RISING;
+    hsd.Init.ClockBypass = SDIO_CLOCK_BYPASS_DISABLE;
+    hsd.Init.ClockPowerSave = SDIO_CLOCK_POWER_SAVE_DISABLE;
+    hsd.Init.BusWide = SDIO_BUS_WIDE_1B;
+    hsd.Init.HardwareFlowControl = SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
+    hsd.Init.ClockDiv = 255;
+
+    HAL_SD_Init(&hsd);
+}
+
+static void MX_SPI3_Init(void)
+{
+    __HAL_RCC_SPI3_CLK_ENABLE();
+
+    hspi3.Instance = SPI3;
+    hspi3.Init.Mode = SPI_MODE_MASTER;
+    hspi3.Init.Direction = SPI_DIRECTION_2LINES;
+    hspi3.Init.DataSize = SPI_DATASIZE_8BIT;
+    hspi3.Init.CLKPolarity = SPI_POLARITY_LOW;
+    hspi3.Init.CLKPhase = SPI_PHASE_1EDGE;
+    hspi3.Init.NSS = SPI_NSS_SOFT;
+    hspi3.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
+    hspi3.Init.FirstBit = SPI_FIRSTBIT_MSB;
+    hspi3.Init.TIMode = SPI_TIMODE_DISABLE;
+    hspi3.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+    hspi3.Init.CRCPolynomial = 10;
+
+    if (HAL_SPI_Init(&hspi3) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+static void MX_UART4_Init(void)
+{
+    __HAL_RCC_UART4_CLK_ENABLE();
+
+    huart4.Instance = UART4;
+    huart4.Init.BaudRate = 115200;
+    huart4.Init.WordLength = UART_WORDLENGTH_8B;
+    huart4.Init.StopBits = UART_STOPBITS_1;
+    huart4.Init.Parity = UART_PARITY_NONE;
+    huart4.Init.Mode = UART_MODE_TX_RX;
+    huart4.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart4.Init.OverSampling = UART_OVERSAMPLING_16;
+
+    if (HAL_UART_Init(&huart4) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOE_CLK_ENABLE();
+
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_1, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
+
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_4 | GPIO_PIN_5, GPIO_PIN_SET);
+
+    GPIO_InitStruct.Pin = LED1_PIN | LORA_CS_PIN | LORA_RST_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = LED2_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = LORA_DIO0_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(LORA_DIO0_PORT, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF6_SPI3;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF8_UART4;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_2;
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+    HAL_GPIO_WritePin(LORA_CS_PORT, LORA_CS_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(LORA_RST_PORT, LORA_RST_PIN, GPIO_PIN_SET);
+}
+
+static void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+    RCC_OscInitStruct.PLL.PLLM = 16;
+    RCC_OscInitStruct.PLL.PLLN = 336;
+    RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+    RCC_OscInitStruct.PLL.PLLQ = 7;
+
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    RCC_ClkInitStruct.ClockType =
+        RCC_CLOCKTYPE_HCLK |
+        RCC_CLOCKTYPE_SYSCLK |
+        RCC_CLOCKTYPE_PCLK1 |
+        RCC_CLOCKTYPE_PCLK2;
+
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+void Error_Handler(void)
+{
+    while (1)
+    {
+        HAL_GPIO_TogglePin(LED1_PORT, LED1_PIN);
+        HAL_GPIO_TogglePin(LED2_PORT, LED2_PIN);
+        HAL_Delay(100);
+    }
+}
+
+
+
