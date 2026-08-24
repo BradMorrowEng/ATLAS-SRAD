@@ -1,0 +1,2152 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, maximum-scale=1"
+  >
+
+  <title>ATLAS Ground Station</title>
+
+  <link
+    rel="stylesheet"
+    href="/map/leaflet.css"
+  >
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: #090909;
+      color: white;
+      font-family: Arial, sans-serif;
+    }
+
+    .header {
+      background: #151515;
+      border-bottom: 1px solid #303030;
+      padding: 13px;
+      text-align: center;
+      position: sticky;
+      top: 0;
+      z-index: 1000;
+    }
+
+    #trackerName {
+      font-size: 25px;
+      font-weight: 800;
+      margin-bottom: 7px;
+    }
+
+    .linkStatus {
+      display: inline-block;
+      border-radius: 20px;
+      padding: 7px 16px;
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .connected {
+      background: #006b3c;
+    }
+
+    .waiting {
+      background: #3c3c3c;
+    }
+
+    .lost {
+      background: #8b0000;
+    }
+
+    #map {
+      width: 100%;
+      height: 30vh;
+      min-height: 220px;
+      max-height: 320px;
+      background: #252525;
+      border-bottom: 1px solid #303030;
+    }
+
+    .mapSelectorBar {
+      padding: 7px 12px 0;
+      background: #090909;
+    }
+
+    #mapSelector {
+      appearance: none;
+      border: 1px solid #303030;
+      border-radius: 9px;
+      background: #1a1a1a;
+      color: #ffffff;
+      padding: 7px 30px 7px 10px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .content {
+      max-width: 760px;
+      margin: auto;
+      padding: 12px;
+    }
+
+    .sectionTitle {
+      color: #999999;
+      font-size: 13px;
+      font-weight: 700;
+      margin: 17px 4px 8px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .card {
+      background: #1a1a1a;
+      border: 1px solid #292929;
+      border-radius: 15px;
+      padding: 14px;
+      min-width: 0;
+    }
+
+    .wide {
+      grid-column: span 2;
+    }
+
+    .label {
+      color: #aaaaaa;
+      font-size: 13px;
+      margin-bottom: 7px;
+    }
+
+    .statusLabel {
+      min-height: 30px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .value {
+      color: #00ee91;
+      font-size: 29px;
+      font-weight: 800;
+      overflow-wrap: anywhere;
+    }
+
+    .mediumValue {
+      color: #00ee91;
+      font-size: 19px;
+      font-weight: 800;
+      overflow-wrap: anywhere;
+    }
+
+    .waitingValue {
+      color: #777777;
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .unit {
+      color: #888888;
+      font-size: 12px;
+      margin-top: 5px;
+    }
+
+    .machInline {
+      margin-top: 10px;
+      padding-top: 9px;
+      border-top: 1px solid #303030;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .machInlineLabel {
+      color: #888888;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .machInlineValue {
+      color: #00ee91;
+      font-size: 20px;
+      font-weight: 800;
+    }
+
+    .machInlineWaiting {
+      color: #777777;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .strengthHeader {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+
+    .strengthPercent {
+      color: #00ee91;
+      font-size: 24px;
+      font-weight: 800;
+    }
+
+    .strengthStatus {
+      font-size: 12px;
+      font-weight: 800;
+      text-align: right;
+    }
+
+    .barBackground {
+      width: 100%;
+      height: 10px;
+      background: #393939;
+      border-radius: 8px;
+      overflow: hidden;
+      margin-top: 10px;
+    }
+
+    .barFill {
+      width: 0%;
+      height: 100%;
+      background: #00ee91;
+      transition: width 0.3s;
+    }
+
+    .detail {
+      color: #aaaaaa;
+      font-size: 11px;
+      margin-top: 7px;
+      min-height: 25px;
+    }
+
+    .flightControls {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 12px;
+      align-items: start;
+    }
+
+    .mainAltitudeControl {
+      position: relative;
+      min-width: 0;
+    }
+
+    #flashOpenButton,
+    #mainAltitudeOpenButton {
+      width: 100%;
+      min-height: 44px;
+      appearance: none;
+      border: 1px solid #292929;
+      border-radius: 15px;
+      background: #1a1a1a;
+      color: #ffffff;
+      padding: 13px 12px;
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.8px;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+
+    #mainAltitudeOpenButton {
+      color: #00ee91;
+    }
+
+    #flashOpenButton:active,
+    #mainAltitudeOpenButton:active {
+      background: #242424;
+    }
+
+    #mainAltitudeOpenButton:disabled {
+      color: #777777;
+      cursor: default;
+    }
+
+    #mainAltitudeStatusText {
+      min-height: 12px;
+      margin-top: 5px;
+      color: #777777;
+      font-size: 9px;
+      font-weight: 800;
+      text-align: center;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    #mainAltitudeMenu {
+      display: none;
+      position: absolute;
+      right: 0;
+      top: 49px;
+      z-index: 2000;
+      width: 100%;
+      max-height: 270px;
+      overflow-y: auto;
+      background: #1a1a1a;
+      border: 1px solid #303030;
+      border-radius: 13px;
+      padding: 7px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+    }
+
+    #mainAltitudeMenu.open {
+      display: block;
+    }
+
+    .mainAltitudeOption {
+      width: 100%;
+      appearance: none;
+      border: 0;
+      border-radius: 9px;
+      background: transparent;
+      color: #ffffff;
+      padding: 10px;
+      font-size: 13px;
+      font-weight: 700;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .mainAltitudeOption:hover,
+    .mainAltitudeOption.current {
+      background: #252525;
+      color: #00ee91;
+    }
+
+    details {
+      background: #151515;
+      border-radius: 14px;
+      margin-top: 17px;
+      padding: 13px;
+      color: #999999;
+      font-size: 12px;
+    }
+
+    #raw {
+      margin-top: 10px;
+      overflow-wrap: anywhere;
+      line-height: 1.5;
+    }
+
+    @media(max-width: 420px) {
+      .content {
+        padding: 9px;
+      }
+
+      .grid {
+        gap: 8px;
+      }
+
+      .card {
+        padding: 12px;
+      }
+
+      .value {
+        font-size: 25px;
+      }
+
+      .mediumValue {
+        font-size: 17px;
+      }
+
+      .strengthPercent {
+        font-size: 21px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+  <div class="header">
+
+    <div id="trackerName">
+      ATLAS Ground Station
+    </div>
+
+    <div
+      id="linkStatus"
+      class="linkStatus waiting"
+    >
+      WAITING FOR TRACKER
+    </div>
+
+  </div>
+
+
+  <div id="map"></div>
+
+  <div class="mapSelectorBar">
+    <select id="mapSelector" aria-label="Offline map selection">
+      <option value="map1">Map 1</option>
+      <option value="map2">Map 2</option>
+    </select>
+  </div>
+
+
+  <div class="content">
+
+    <div class="sectionTitle">
+      Flight Data
+    </div>
+
+    <div class="grid">
+
+      <div class="card">
+
+        <div class="label">
+          Altitude
+        </div>
+
+        <div
+          id="altitude"
+          class="waitingValue"
+        >
+          WAITING
+        </div>
+
+        <div class="unit">
+          feet
+        </div>
+
+      </div>
+
+
+      <div class="card">
+
+        <div class="label">
+          Vertical Speed
+        </div>
+
+        <div
+          id="descentRate"
+          class="waitingValue"
+        >
+          WAITING
+        </div>
+
+        <div class="unit">
+          feet per second
+        </div>
+
+        <div class="machInline">
+          <div class="machInlineLabel">
+            Mach
+          </div>
+
+          <div
+            id="machNumber"
+            class="machInlineWaiting"
+          >
+            WAITING
+          </div>
+        </div>
+
+      </div>
+
+
+      <div class="card wide">
+
+        <div class="label">
+          Onboard GPS Coordinates
+        </div>
+
+        <div
+          id="coordinates"
+          class="waitingValue"
+        >
+          WAITING FOR GPS
+        </div>
+
+      </div>
+
+    </div>
+
+
+    <div class="sectionTitle">
+      Direction to Tracker
+    </div>
+
+    <div class="grid">
+
+      <div class="card">
+
+        <div class="label">
+          Distance
+        </div>
+
+        <div
+          id="distance"
+          class="waitingValue"
+        >
+          WAITING
+        </div>
+
+        <div class="unit">
+          metres
+        </div>
+
+      </div>
+
+
+      <div class="card">
+
+        <div class="label">
+          Bearing
+        </div>
+
+        <div
+          id="bearing"
+          class="waitingValue"
+        >
+          WAITING
+        </div>
+
+        <div class="unit">
+          from north
+        </div>
+
+      </div>
+
+
+      <div class="card wide">
+
+        <div class="label">
+          Ground Station GPS
+        </div>
+
+        <div
+          id="groundGpsStatus"
+          class="waitingValue"
+        >
+          WAITING FOR GPS
+        </div>
+
+      </div>
+
+    </div>
+
+
+    <div class="sectionTitle">
+      Tracker Status
+    </div>
+
+    <div class="grid">
+
+      <div class="card wide">
+
+        <div class="label">
+          Last Seen
+        </div>
+
+        <div
+          id="lastSeen"
+          class="waitingValue"
+        >
+          NO PACKETS
+        </div>
+
+      </div>
+
+
+      <div class="card">
+
+        <div class="label statusLabel">
+          Onboard GPS Strength
+        </div>
+
+        <div class="strengthHeader">
+
+          <div
+            id="onboardGpsPercent"
+            class="strengthPercent"
+          ></div>
+
+          <div
+            id="onboardGpsStatus"
+            class="strengthStatus"
+          >
+            WAITING
+          </div>
+
+        </div>
+
+        <div class="barBackground">
+
+          <div
+            id="onboardGpsBar"
+            class="barFill"
+          ></div>
+
+        </div>
+
+        <div
+          id="onboardGpsDetail"
+          class="detail"
+        >
+          No satellite data
+        </div>
+
+      </div>
+
+
+      <div class="card">
+
+        <div class="label statusLabel">
+          GS GPS Strength
+        </div>
+
+        <div class="strengthHeader">
+
+          <div
+            id="gsGpsPercent"
+            class="strengthPercent"
+          ></div>
+
+          <div
+            id="gsGpsStatus"
+            class="strengthStatus"
+          >
+            WAITING
+          </div>
+
+        </div>
+
+        <div class="barBackground">
+
+          <div
+            id="gsGpsBar"
+            class="barFill"
+          ></div>
+
+        </div>
+
+        <div
+          id="gsGpsDetail"
+          class="detail"
+        >
+          No satellite data
+        </div>
+
+      </div>
+
+
+      <div class="card">
+
+        <div class="label statusLabel">
+          Onboard Battery
+        </div>
+
+        <div class="strengthHeader">
+
+          <div
+            id="onboardBatteryPercent"
+            class="strengthPercent"
+          ></div>
+
+          <div
+            id="onboardBatteryStatus"
+            class="strengthStatus"
+          >
+            WAITING
+          </div>
+
+        </div>
+
+        <div class="barBackground">
+
+          <div
+            id="onboardBatteryBar"
+            class="barFill"
+          ></div>
+
+        </div>
+
+        <div
+          id="onboardBatteryDetail"
+          class="detail"
+        >
+          No battery data
+        </div>
+
+      </div>
+
+
+      <div class="card">
+
+        <div class="label statusLabel">
+          GS Battery
+        </div>
+
+        <div class="strengthHeader">
+
+          <div
+            id="gsBatteryPercent"
+            class="strengthPercent"
+          ></div>
+
+          <div
+            id="gsBatteryStatus"
+            class="strengthStatus"
+          >
+            WAITING
+          </div>
+
+        </div>
+
+        <div class="barBackground">
+
+          <div
+            id="gsBatteryBar"
+            class="barFill"
+          ></div>
+
+        </div>
+
+        <div
+          id="gsBatteryDetail"
+          class="detail"
+        >
+          Waiting for STM32 data
+        </div>
+
+      </div>
+
+
+      <div class="card wide">
+
+        <div class="label">
+          LoRa Link Strength
+        </div>
+
+        <div class="strengthHeader">
+
+          <div
+            id="loraPercent"
+            class="strengthPercent"
+          ></div>
+
+          <div
+            id="loraStatus"
+            class="strengthStatus"
+          >
+            WAITING
+          </div>
+
+        </div>
+
+        <div class="barBackground">
+
+          <div
+            id="loraBar"
+            class="barFill"
+          ></div>
+
+        </div>
+
+        <div
+          id="loraDetail"
+          class="detail"
+        >
+          No radio data
+        </div>
+
+      </div>
+
+    </div>
+
+
+    <div class="flightControls">
+
+      <button
+        id="flashOpenButton"
+        type="button"
+      >
+        Flash
+      </button>
+
+
+      <div class="mainAltitudeControl">
+
+        <button
+          id="mainAltitudeOpenButton"
+          type="button"
+          aria-expanded="false"
+        >
+          Main -- ft
+        </button>
+
+        <div id="mainAltitudeMenu"></div>
+
+        <div id="mainAltitudeStatusText">
+          SYNCING
+        </div>
+
+      </div>
+
+    </div>
+
+
+    <details>
+
+      <summary>
+        Technical Information
+      </summary>
+
+      <div id="debugInfo">
+        Waiting for live data
+      </div>
+
+      <div id="raw"></div>
+
+    </details>
+
+  </div>
+
+
+  <script src="/map/leaflet.js"></script>
+
+
+  <script>
+    const defaultMapPosition = [
+      47.966258,
+      -81.869796
+    ];
+
+
+    const map = L.map(
+      "map",
+      {
+        minZoom: 12,
+        maxZoom: 16,
+        zoomControl: true
+      }
+    ).setView(
+      defaultMapPosition,
+      15
+    );
+
+
+    const offlineMaps = {
+      map1: {
+        path: "/tiles/{z}/{x}/{y}.png",
+        center: [47.966258, -81.869796],
+        zoom: 15
+      },
+      map2: {
+        path: "/tiles1/{z}/{x}/{y}.png",
+        center: [48.476180, -81.330812],
+        zoom: 15
+      }
+    };
+
+
+    let activeTileLayer = L.tileLayer(
+      offlineMaps.map1.path,
+      {
+        minZoom: 12,
+        maxZoom: 16,
+        tileSize: 256,
+        noWrap: true
+      }
+    ).addTo(map);
+
+
+    document
+      .getElementById("mapSelector")
+      .addEventListener(
+        "change",
+        event => {
+
+          const selectedMap =
+            offlineMaps[event.target.value];
+
+          if (!selectedMap)
+          {
+            return;
+          }
+
+          map.removeLayer(
+            activeTileLayer
+          );
+
+          activeTileLayer = L.tileLayer(
+            selectedMap.path,
+            {
+              minZoom: 12,
+              maxZoom: 16,
+              tileSize: 256,
+              noWrap: true
+            }
+          ).addTo(map);
+
+          map.setView(
+            selectedMap.center,
+            selectedMap.zoom
+          );
+        }
+      );
+
+
+    let groundMarker = null;
+    let onboardMarker = null;
+
+    let lastOnboardPacket = "";
+    let firstMapFit = true;
+
+    const onboardPath = [];
+
+
+    const onboardTrail = L.polyline(
+      [],
+      {
+        color: "#ff7a00",
+        weight: 5,
+        opacity: 0.9
+      }
+    ).addTo(map);
+
+
+    function numberValue(value)
+    {
+      if (
+        value === null ||
+        value === undefined ||
+        value === "" ||
+        value === "---"
+      )
+      {
+        return null;
+      }
+
+      const parsed = Number(value);
+
+      if (!Number.isFinite(parsed))
+      {
+        return null;
+      }
+
+      return parsed;
+    }
+
+
+    function clamp(
+      value,
+      minimum,
+      maximum
+    )
+    {
+      return Math.min(
+        Math.max(value, minimum),
+        maximum
+      );
+    }
+
+
+    function setBar(
+      elementId,
+      percent
+    )
+    {
+      document
+        .getElementById(elementId)
+        .style.width =
+        clamp(percent, 0, 100) + "%";
+    }
+
+
+    function setLiveValue(
+      elementId,
+      text,
+      className
+    )
+    {
+      const element =
+        document.getElementById(elementId);
+
+      element.innerText = text;
+      element.className = className;
+    }
+
+
+    function clearStrength(
+      prefix,
+      statusText,
+      detailText
+    )
+    {
+      document.getElementById(
+        prefix + "Percent"
+      ).innerText = "";
+
+      document.getElementById(
+        prefix + "Status"
+      ).innerText =
+        statusText;
+
+      document.getElementById(
+        prefix + "Detail"
+      ).innerText =
+        detailText;
+
+      setBar(
+        prefix + "Bar",
+        0
+      );
+    }
+
+
+    function showStrength(
+      prefix,
+      percent,
+      statusText,
+      detailText
+    )
+    {
+      document.getElementById(
+        prefix + "Percent"
+      ).innerText =
+        percent + "%";
+
+      document.getElementById(
+        prefix + "Status"
+      ).innerText =
+        statusText;
+
+      document.getElementById(
+        prefix + "Detail"
+      ).innerText =
+        detailText;
+
+      setBar(
+        prefix + "Bar",
+        percent
+      );
+    }
+
+
+    function gpsStrength(satelliteCount)
+    {
+      if (satelliteCount <= 0)
+      {
+        return {
+          percent: 0,
+          status: "NO GPS"
+        };
+      }
+
+      if (satelliteCount === 1)
+      {
+        return {
+          percent: 10,
+          status: "WEAK"
+        };
+      }
+
+      if (satelliteCount === 2)
+      {
+        return {
+          percent: 20,
+          status: "WEAK"
+        };
+      }
+
+      if (satelliteCount === 3)
+      {
+        return {
+          percent: 30,
+          status: "WEAK"
+        };
+      }
+
+      if (satelliteCount === 4)
+      {
+        return {
+          percent: 45,
+          status: "FAIR"
+        };
+      }
+
+      if (satelliteCount === 5)
+      {
+        return {
+          percent: 55,
+          status: "FAIR"
+        };
+      }
+
+      if (satelliteCount === 6)
+      {
+        return {
+          percent: 70,
+          status: "GOOD"
+        };
+      }
+
+      if (satelliteCount === 7)
+      {
+        return {
+          percent: 75,
+          status: "GOOD"
+        };
+      }
+
+      if (satelliteCount === 8)
+      {
+        return {
+          percent: 80,
+          status: "GOOD"
+        };
+      }
+
+      if (satelliteCount === 9)
+      {
+        return {
+          percent: 85,
+          status: "STRONG"
+        };
+      }
+
+      if (satelliteCount === 10)
+      {
+        return {
+          percent: 90,
+          status: "STRONG"
+        };
+      }
+
+      if (satelliteCount === 11)
+      {
+        return {
+          percent: 95,
+          status: "STRONG"
+        };
+      }
+
+      return {
+        percent: 100,
+        status: "GREAT"
+      };
+    }
+
+
+    function batteryStrength(voltage)
+    {
+      let percent = 0;
+
+      if (voltage >= 8.4)
+      {
+        percent = 100;
+      }
+      else if (voltage >= 8.2)
+      {
+        percent =
+          90 +
+          ((voltage - 8.2) / 0.2) * 10;
+      }
+      else if (voltage >= 8.0)
+      {
+        percent =
+          80 +
+          ((voltage - 8.0) / 0.2) * 10;
+      }
+      else if (voltage >= 7.8)
+      {
+        percent =
+          65 +
+          ((voltage - 7.8) / 0.2) * 15;
+      }
+      else if (voltage >= 7.6)
+      {
+        percent =
+          50 +
+          ((voltage - 7.6) / 0.2) * 15;
+      }
+      else if (voltage >= 7.4)
+      {
+        percent =
+          35 +
+          ((voltage - 7.4) / 0.2) * 15;
+      }
+      else if (voltage >= 7.2)
+      {
+        percent =
+          20 +
+          ((voltage - 7.2) / 0.2) * 15;
+      }
+      else if (voltage >= 7.0)
+      {
+        percent =
+          10 +
+          ((voltage - 7.0) / 0.2) * 10;
+      }
+      else if (voltage >= 6.6)
+      {
+        percent =
+          ((voltage - 6.6) / 0.4) * 10;
+      }
+
+      percent = Math.round(
+        clamp(percent, 0, 100)
+      );
+
+      let status = "CRITICAL";
+
+      if (percent >= 90)
+      {
+        status = "FULL";
+      }
+      else if (percent >= 70)
+      {
+        status = "GOOD";
+      }
+      else if (percent >= 40)
+      {
+        status = "FAIR";
+      }
+      else if (percent >= 20)
+      {
+        status = "LOW";
+      }
+
+      return {
+        percent: percent,
+        status: status
+      };
+    }
+
+
+    function loraStrength(
+      rssi,
+      snr
+    )
+    {
+      const rssiPercent = clamp(
+        ((rssi + 120) / 80) * 100,
+        0,
+        100
+      );
+
+      const snrPercent = clamp(
+        ((snr + 20) / 30) * 100,
+        0,
+        100
+      );
+
+      const percent = Math.round(
+        rssiPercent * 0.75 +
+        snrPercent * 0.25
+      );
+
+      let status = "WEAK";
+
+      if (percent >= 90)
+      {
+        status = "GREAT";
+      }
+      else if (percent >= 70)
+      {
+        status = "GOOD";
+      }
+      else if (percent >= 40)
+      {
+        status = "FAIR";
+      }
+
+      return {
+        percent: percent,
+        status: status
+      };
+    }
+
+
+    function formatLastSeen(
+      age,
+      packetCount
+    )
+    {
+      if (packetCount === 0)
+      {
+        return "NO PACKETS";
+      }
+
+      if (age < 1000)
+      {
+        return "NOW";
+      }
+
+      if (age < 60000)
+      {
+        return (
+          age / 1000
+        ).toFixed(1) +
+        " seconds ago";
+      }
+
+      return (
+        age / 60000
+      ).toFixed(1) +
+      " minutes ago";
+    }
+
+
+    function updateGroundMarker(data)
+    {
+      if (!data.gsFix)
+      {
+        return;
+      }
+
+      const latitude =
+        numberValue(data.gsLat);
+
+      const longitude =
+        numberValue(data.gsLon);
+
+      if (
+        latitude === null ||
+        longitude === null ||
+        latitude === 0 ||
+        longitude === 0
+      )
+      {
+        return;
+      }
+
+      const position = [
+        latitude,
+        longitude
+      ];
+
+      if (groundMarker === null)
+      {
+        groundMarker = L.circleMarker(
+          position,
+          {
+            radius: 9,
+            weight: 3,
+            color: "#00ee91",
+            fillColor: "#00ee91",
+            fillOpacity: 1
+          }
+        ).addTo(map);
+
+        groundMarker.bindTooltip(
+          "Ground Station",
+          {
+            permanent: true,
+            direction: "bottom"
+          }
+        );
+      }
+      else
+      {
+        groundMarker.setLatLng(
+          position
+        );
+      }
+    }
+
+
+    function updateOnboardMarker(data)
+    {
+      if (!data.onboardFix)
+      {
+        return;
+      }
+
+      const latitude =
+        numberValue(data.lat);
+
+      const longitude =
+        numberValue(data.lon);
+
+      if (
+        latitude === null ||
+        longitude === null ||
+        latitude === 0 ||
+        longitude === 0
+      )
+      {
+        return;
+      }
+
+      const position = [
+        latitude,
+        longitude
+      ];
+
+      if (onboardMarker === null)
+      {
+        onboardMarker = L.circleMarker(
+          position,
+          {
+            radius: 10,
+            weight: 3,
+            color: "#ff7a00",
+            fillColor: "#ff7a00",
+            fillOpacity: 1
+          }
+        ).addTo(map);
+
+        onboardMarker.bindTooltip(
+          data.name || "Onboard ATLAS",
+          {
+            permanent: true,
+            direction: "top"
+          }
+        );
+      }
+      else
+      {
+        onboardMarker.setLatLng(
+          position
+        );
+
+        onboardMarker.setTooltipContent(
+          data.name ||
+          "Onboard ATLAS"
+        );
+      }
+
+      const currentPacket =
+        String(data.pkt || "");
+
+      if (
+        currentPacket.length === 0 ||
+        currentPacket === lastOnboardPacket
+      )
+      {
+        return;
+      }
+
+      lastOnboardPacket =
+        currentPacket;
+
+      onboardPath.push(
+        position
+      );
+
+      onboardTrail.setLatLngs(
+        onboardPath
+      );
+    }
+
+
+    function fitMapOnce()
+    {
+      if (!firstMapFit)
+      {
+        return;
+      }
+
+      if (
+        groundMarker === null ||
+        onboardMarker === null
+      )
+      {
+        return;
+      }
+
+      firstMapFit = false;
+
+      map.fitBounds(
+        [
+          groundMarker.getLatLng(),
+          onboardMarker.getLatLng()
+        ],
+        {
+          padding: [35, 35],
+          maxZoom: 17
+        }
+      );
+    }
+
+
+    const mainAltitudeButton =
+      document.getElementById(
+        "mainAltitudeOpenButton"
+      );
+
+    const mainAltitudeMenu =
+      document.getElementById(
+        "mainAltitudeMenu"
+      );
+
+    const mainAltitudeStatusText =
+      document.getElementById(
+        "mainAltitudeStatusText"
+      );
+
+    const mainAltitudeValues = [
+      "500",
+      "750",
+      "1000",
+      "1250",
+      "1500",
+      "1750",
+      "2000"
+    ];
+
+
+    mainAltitudeValues.forEach(
+      altitude => {
+
+        const option =
+          document.createElement(
+            "button"
+          );
+
+        option.type = "button";
+        option.className =
+          "mainAltitudeOption";
+
+        option.dataset.altitude =
+          altitude;
+
+        option.innerText =
+          altitude + " ft";
+
+
+        option.addEventListener(
+          "click",
+          () => {
+
+            mainAltitudeMenu.classList.remove(
+              "open"
+            );
+
+            mainAltitudeButton.setAttribute(
+              "aria-expanded",
+              "false"
+            );
+
+            mainAltitudeButton.disabled =
+              true;
+
+            mainAltitudeStatusText.innerText =
+              "SENDING";
+
+
+            fetch(
+              "/set-main-altitude?ft=" +
+              encodeURIComponent(altitude),
+              {
+                method: "POST"
+              }
+            )
+              .then(
+                response =>
+                  response.json()
+              )
+              .then(result => {
+
+                if (!result.ok)
+                {
+                  throw new Error(
+                    result.message ||
+                    "Rejected"
+                  );
+                }
+
+                mainAltitudeStatusText.innerText =
+                  "WAITING FOR ATLAS V2";
+              })
+              .catch(() => {
+
+                mainAltitudeStatusText.innerText =
+                  "FAILED";
+
+                mainAltitudeButton.disabled =
+                  false;
+              });
+          }
+        );
+
+
+        mainAltitudeMenu.appendChild(
+          option
+        );
+      }
+    );
+
+
+    mainAltitudeButton.addEventListener(
+      "click",
+      event => {
+
+        event.stopPropagation();
+
+        const opening =
+          !mainAltitudeMenu.classList.contains(
+            "open"
+          );
+
+        mainAltitudeMenu.classList.toggle(
+          "open",
+          opening
+        );
+
+        mainAltitudeButton.setAttribute(
+          "aria-expanded",
+          opening ? "true" : "false"
+        );
+      }
+    );
+
+
+    document.addEventListener(
+      "click",
+      event => {
+
+        if (
+          !event.target.closest(
+            ".mainAltitudeControl"
+          )
+        )
+        {
+          mainAltitudeMenu.classList.remove(
+            "open"
+          );
+
+          mainAltitudeButton.setAttribute(
+            "aria-expanded",
+            "false"
+          );
+        }
+      }
+    );
+
+
+    document
+      .getElementById("flashOpenButton")
+      .addEventListener(
+        "click",
+        () => {
+          window.parent.postMessage(
+            "ATLAS_OPEN_FLASH",
+            "*"
+          );
+        }
+      );
+
+
+    function updatePage()
+    {
+      fetch(
+        "/data",
+        {
+          cache: "no-store"
+        }
+      )
+        .then(
+          response => response.json()
+        )
+        .then(data => {
+
+          updateGroundMarker(data);
+
+          updateOnboardMarker(data);
+
+          fitMapOnce();
+
+
+          const linkStatus =
+            document.getElementById(
+              "linkStatus"
+            );
+
+
+          document.getElementById(
+            "trackerName"
+          ).innerText =
+            data.name ||
+            "ATLAS Ground Station";
+
+
+          if (Number(data.count) === 0)
+          {
+            linkStatus.innerText =
+              "WAITING FOR TRACKER";
+
+            linkStatus.className =
+              "linkStatus waiting";
+          }
+          else if (
+            Number(data.age) <
+            Number(data.timeout)
+          )
+          {
+            linkStatus.innerText =
+              "TRACKER CONNECTED";
+
+            linkStatus.className =
+              "linkStatus connected";
+          }
+          else
+          {
+            linkStatus.innerText =
+              "TRACKER CONNECTION LOST";
+
+            linkStatus.className =
+              "linkStatus lost";
+          }
+
+
+          const altitude =
+            numberValue(data.altft);
+
+          if (altitude !== null)
+          {
+            setLiveValue(
+              "altitude",
+              altitude.toLocaleString(
+                undefined,
+                {
+                  maximumFractionDigits: 1
+                }
+              ),
+              "value"
+            );
+          }
+
+
+          const descent =
+            numberValue(data.descfts);
+
+          if (descent !== null)
+          {
+            let verticalSpeedText =
+              descent.toFixed(1);
+
+            if (descent > 0)
+            {
+              verticalSpeedText =
+                "+" + verticalSpeedText;
+            }
+
+            setLiveValue(
+              "descentRate",
+              verticalSpeedText,
+              "value"
+            );
+          }
+
+
+          const mach =
+            numberValue(data.mach);
+
+          if (mach !== null)
+          {
+            setLiveValue(
+              "machNumber",
+              mach.toFixed(2),
+              "machInlineValue"
+            );
+          }
+          else
+          {
+            setLiveValue(
+              "machNumber",
+              "WAITING",
+              "machInlineWaiting"
+            );
+          }
+
+
+          const onboardLatitude =
+            numberValue(data.lat);
+
+          const onboardLongitude =
+            numberValue(data.lon);
+
+          if (
+            onboardLatitude !== null &&
+            onboardLongitude !== null
+          )
+          {
+            setLiveValue(
+              "coordinates",
+              onboardLatitude.toFixed(6) +
+              ", " +
+              onboardLongitude.toFixed(6),
+              "mediumValue"
+            );
+          }
+
+
+          setLiveValue(
+            "lastSeen",
+            formatLastSeen(
+              Number(data.age),
+              Number(data.count)
+            ),
+            Number(data.count) > 0
+              ? "mediumValue"
+              : "waitingValue"
+          );
+
+
+          if (
+            data.gsFix &&
+            data.onboardFix
+          )
+          {
+            const distance =
+              numberValue(
+                data.distanceM
+              );
+
+            const bearing =
+              numberValue(
+                data.bearingDeg
+              );
+
+            if (distance !== null)
+            {
+              setLiveValue(
+                "distance",
+                Math.round(distance).toLocaleString(),
+                "value"
+              );
+            }
+
+            if (bearing !== null)
+            {
+              setLiveValue(
+                "bearing",
+                Math.round(bearing) +
+                "° " +
+                (
+                  data.bearingDirection ||
+                  ""
+                ),
+                "value"
+              );
+            }
+          }
+
+
+          if (data.gsFix)
+          {
+            const gsLatitude =
+              numberValue(data.gsLat);
+
+            const gsLongitude =
+              numberValue(data.gsLon);
+
+            if (
+              gsLatitude !== null &&
+              gsLongitude !== null
+            )
+            {
+              setLiveValue(
+                "groundGpsStatus",
+                gsLatitude.toFixed(6) +
+                ", " +
+                gsLongitude.toFixed(6),
+                "mediumValue"
+              );
+            }
+          }
+
+
+          const onboardSatellites =
+            numberValue(data.sats);
+
+          if (onboardSatellites !== null)
+          {
+            const strength =
+              gpsStrength(
+                Math.round(
+                  onboardSatellites
+                )
+              );
+
+            showStrength(
+              "onboardGps",
+              strength.percent,
+              strength.status,
+              Math.round(
+                onboardSatellites
+              ) +
+              " satellites"
+            );
+          }
+          else
+          {
+            clearStrength(
+              "onboardGps",
+              "WAITING",
+              "No satellite data"
+            );
+          }
+
+
+          const groundSatellites =
+            numberValue(data.gsSats);
+
+          if (groundSatellites !== null)
+          {
+            const strength =
+              gpsStrength(
+                Math.round(
+                  groundSatellites
+                )
+              );
+
+            let detail =
+              Math.round(
+                groundSatellites
+              ) +
+              " satellites";
+
+            const hdop =
+              numberValue(
+                data.gsHdop
+              );
+
+            if (hdop !== null)
+            {
+              detail +=
+                ", HDOP " +
+                hdop.toFixed(2);
+            }
+
+            showStrength(
+              "gsGps",
+              strength.percent,
+              strength.status,
+              detail
+            );
+          }
+          else
+          {
+            clearStrength(
+              "gsGps",
+              "WAITING",
+              "No satellite data"
+            );
+          }
+
+
+          const onboardVoltage =
+            numberValue(data.batv);
+
+          if (onboardVoltage !== null)
+          {
+            const battery =
+              batteryStrength(
+                onboardVoltage
+              );
+
+            showStrength(
+              "onboardBattery",
+              battery.percent,
+              battery.status,
+              onboardVoltage.toFixed(2) +
+              " volts"
+            );
+          }
+          else
+          {
+            clearStrength(
+              "onboardBattery",
+              "WAITING",
+              "No battery data"
+            );
+          }
+
+
+          const gsVoltage =
+            numberValue(data.gsbatv);
+
+          if (gsVoltage !== null)
+          {
+            const battery =
+              batteryStrength(
+                gsVoltage
+              );
+
+            showStrength(
+              "gsBattery",
+              battery.percent,
+              battery.status,
+              gsVoltage.toFixed(2) +
+              " volts"
+            );
+          }
+          else
+          {
+            clearStrength(
+              "gsBattery",
+              "WAITING",
+              "Waiting for STM32 data"
+            );
+          }
+
+
+          const rssi =
+            numberValue(data.rssi);
+
+          const snr =
+            numberValue(data.snr);
+
+          if (
+            rssi !== null &&
+            snr !== null
+          )
+          {
+            const lora =
+              loraStrength(
+                rssi,
+                snr
+              );
+
+            showStrength(
+              "lora",
+              lora.percent,
+              lora.status,
+              "Radio connection quality"
+            );
+          }
+          else
+          {
+            clearStrength(
+              "lora",
+              "WAITING",
+              "No radio data"
+            );
+          }
+
+
+          const mainAltitude =
+            String(
+              data.mainAltitudeFt || ""
+            );
+
+          const mainAltitudeState =
+            String(
+              data.mainAltitudeStatus ||
+              "UNKNOWN"
+            );
+
+          const mainAltitudeBusy = [
+            "SENDING",
+            "WAITING",
+            "PENDING",
+            "COMMAND_SENT",
+            "BUSY",
+            "SYNCING"
+          ];
+
+
+          mainAltitudeButton.innerText =
+            mainAltitude.length > 0
+              ? "MAIN " +
+                mainAltitude +
+                " FT"
+              : "MAIN -- FT";
+
+
+          mainAltitudeStatusText.innerText =
+            mainAltitudeState.replace(
+              /_/g,
+              " "
+            );
+
+
+          mainAltitudeButton.disabled =
+            mainAltitudeBusy.includes(
+              mainAltitudeState
+            );
+
+
+          document
+            .querySelectorAll(
+              ".mainAltitudeOption"
+            )
+            .forEach(option => {
+
+              option.classList.toggle(
+                "current",
+                option.dataset.altitude ===
+                  mainAltitude
+              );
+            });
+
+
+          document.getElementById(
+            "debugInfo"
+          ).innerText =
+            "Packet: " +
+            (data.pkt || "") +
+            " | Packets: " +
+            (data.count || 0) +
+            " | GPS fix: " +
+            (data.gpsfix || "") +
+            " | GPS altitude: " +
+            (data.gpsaltft || "") +
+            " ft | GPS vertical speed: " +
+            (data.gpsvsfts || "") +
+            " ft/s | GPS age: " +
+            (data.gpsage || "") +
+            " ms | Onboard battery: " +
+            (data.batv || "") +
+            " V | GS battery: " +
+            (data.gsbatv || "") +
+            " V | RSSI: " +
+            (data.rssi || "") +
+            " dBm | SNR: " +
+            (data.snr || "") +
+            " dB";
+
+
+          document.getElementById(
+            "raw"
+          ).innerText =
+            data.latest || "";
+
+        })
+        .catch(() => {
+
+          const linkStatus =
+            document.getElementById(
+              "linkStatus"
+            );
+
+          linkStatus.innerText =
+            "ESP32 CONNECTION LOST";
+
+          linkStatus.className =
+            "linkStatus lost";
+
+        });
+    }
+
+
+    setInterval(
+      updatePage,
+      500
+    );
+
+
+    updatePage();
+  </script>
+
+</body>
+</html>
