@@ -1,0 +1,3161 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <TinyGPSPlus.h>
+#include <SPI.h>
+#include <SD.h>
+#include <math.h>
+
+const char* AP_NAME = "ATLAS-GS";
+const char* AP_PASS = "ATLAS915";
+
+#define ATLAS_RX_PIN 32
+#define ATLAS_TX_PIN 33
+#define ATLAS_BAUD 115200
+
+#define GS_GPS_RX_PIN 34
+#define GS_GPS_TX_PIN -1
+#define GS_GPS_BAUD 9600
+
+#define SD_SCK_PIN 18
+#define SD_MISO_PIN 19
+#define SD_MOSI_PIN 23
+#define SD_CS_PIN 13
+
+/* Status LEDs. */
+#define GREEN_LED_PIN 16
+#define YELLOW_LED_PIN 15
+#define PKT_LED_TIMEOUT_MS 6000UL
+
+#define LINK_TIMEOUT_MS 6000
+#define GS_FIX_TIMEOUT_MS 10000
+
+WebServer server(80);
+
+HardwareSerial AtlasSerial(2);
+HardwareSerial GroundGpsSerial(1);
+
+TinyGPSPlus groundGps;
+
+SPIClass sdSPI(VSPI);
+
+String inputLine = "";
+String latestLine = "";
+
+unsigned long packetCount = 0;
+unsigned long lastPacketTime = 0;
+unsigned long uartCharCount = 0;
+unsigned long lastValidPktTime = 0;
+
+double groundLatitude = 0.0;
+double groundLongitude = 0.0;
+
+unsigned long groundLastFixTime = 0;
+
+String trackerName = "ATLAS";
+String pkt = "";
+String altitudeFt = "";
+String latitude = "";
+String longitude = "";
+String descentFtS = "";
+String satellites = "";
+String gpsFixType = "";
+String gpsAltitudeFt = "";
+String gpsVerticalSpeedFtS = "";
+String gpsAgeMs = "";
+String batteryVoltage = "";
+String groundStationBatteryVoltage = "";
+String loraRssi = "";
+String loraSnr = "";
+String actualRadioFrequencyHz = "";
+
+String currentLoraFrequency = "915.0";
+String requestedLoraFrequency = "";
+String frequencyStatus = "READY";
+
+/*
+ * MAIN deployment altitude shown by the GS UI.
+ *
+ * The active value is learned from ATLAS V2 through CMD,HEALTH so the UI
+ * does not assume the 1000 ft default when V2 restored a persisted setting.
+ */
+String currentMainAltitudeFt = "";
+String requestedMainAltitudeFt = "";
+String mainAltitudeStatus = "UNKNOWN";
+unsigned long mainAltitudeCommandTime = 0;
+#define MAIN_ALTITUDE_COMMAND_TIMEOUT_MS 8000UL
+
+String flashStatus = "READY";
+String flashVerify = "NOT RUN";
+String flashBytes = "0";
+String flashUsedBytes = "0";
+String flashTotalBytes = "16777216";
+bool flashMaintenanceActive = false;
+unsigned long flashCommandTime = 0;
+unsigned long flashInfoRequestTime = 0;
+#define FLASH_COMMAND_TIMEOUT_MS 240000UL
+
+unsigned long frequencyCommandTime = 0;
+#define FREQUENCY_COMMAND_TIMEOUT_MS 8000
+
+const char FREQUENCY_WRAPPER_PAGE[] PROGMEM = R"freqpage(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, maximum-scale=1"
+  >
+
+  <title>ATLAS Ground Station</title>
+
+  <style>
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #090909;
+    }
+
+    #atlasUiFrame {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: #090909;
+    }
+
+    #atlasFrequencyControl {
+      position: fixed;
+      top: 14px;
+      right: 14px;
+      z-index: 9999;
+      font-family: Arial, sans-serif;
+      text-align: right;
+    }
+
+    #atlasFrequencyButton {
+      appearance: none;
+      border: 1px solid #303030;
+      border-radius: 18px;
+      background: #1d1d1d;
+      color: #00ee91;
+      padding: 7px 11px;
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    #atlasFrequencyButton:disabled {
+      color: #777777;
+      cursor: default;
+    }
+
+    #atlasFrequencyMenu {
+      display: none;
+      position: absolute;
+      right: 0;
+      top: 42px;
+      width: 174px;
+      max-height: 310px;
+      overflow-y: auto;
+      background: #1a1a1a;
+      border: 1px solid #303030;
+      border-radius: 13px;
+      padding: 7px;
+      text-align: left;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    }
+
+    #atlasFrequencyMenu.open {
+      display: block;
+    }
+
+    .atlasFrequencyGroup {
+      color: #777777;
+      font-size: 10px;
+      font-weight: 800;
+      padding: 9px 10px 5px;
+      text-transform: uppercase;
+      letter-spacing: 0.7px;
+    }
+
+    .atlasFrequencyOption {
+      width: 100%;
+      border: 0;
+      border-radius: 9px;
+      background: transparent;
+      color: white;
+      padding: 10px;
+      text-align: left;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .atlasFrequencyOption:hover,
+    .atlasFrequencyOption.current {
+      background: #252525;
+      color: #00ee91;
+    }
+
+    #atlasFrequencyStatus {
+      color: #8f8f8f;
+      font-size: 10px;
+      font-weight: 700;
+      margin-top: 5px;
+      text-transform: uppercase;
+    }
+
+    #atlasMainAltitudeControl {
+      display: none;
+      position: fixed;
+      top: 76px;
+      right: 14px;
+      z-index: 9998;
+      font-family: Arial, sans-serif;
+      text-align: right;
+    }
+
+    #atlasMainAltitudeButton {
+      appearance: none;
+      border: 1px solid #303030;
+      border-radius: 18px;
+      background: #1d1d1d;
+      color: #00ee91;
+      padding: 7px 11px;
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    #atlasMainAltitudeButton:disabled {
+      color: #777777;
+      cursor: default;
+    }
+
+    #atlasMainAltitudeMenu {
+      display: none;
+      position: absolute;
+      right: 0;
+      top: 42px;
+      width: 142px;
+      max-height: 280px;
+      overflow-y: auto;
+      background: #1a1a1a;
+      border: 1px solid #303030;
+      border-radius: 13px;
+      padding: 7px;
+      text-align: left;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    }
+
+    #atlasMainAltitudeMenu.open {
+      display: block;
+    }
+
+    .atlasMainAltitudeOption {
+      width: 100%;
+      border: 0;
+      border-radius: 9px;
+      background: transparent;
+      color: white;
+      padding: 10px;
+      text-align: left;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .atlasMainAltitudeOption:hover,
+    .atlasMainAltitudeOption.current {
+      background: #252525;
+      color: #00ee91;
+    }
+
+    #atlasMainAltitudeStatus {
+      color: #8f8f8f;
+      font-size: 10px;
+      font-weight: 700;
+      margin-top: 5px;
+      text-transform: uppercase;
+    }
+
+    #atlasFlashPanelFull {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 30000;
+      background: rgba(0,0,0,0.92);
+      font-family: Arial, sans-serif;
+      color: white;
+      padding: 20px;
+      box-sizing: border-box;
+      overflow-y: auto;
+    }
+
+    #atlasFlashPanelFull.open {
+      display: block;
+    }
+
+    #atlasFlashPanelCard {
+      width: min(520px, 100%);
+      margin: 35px auto;
+      background: #171717;
+      border: 1px solid #383838;
+      border-radius: 18px;
+      padding: 22px;
+      box-sizing: border-box;
+    }
+
+    .atlasFlashPanelRow {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 10px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+      font-size: 13px;
+    }
+
+    #atlasFlashUsageOuter {
+      margin-top: 18px;
+      width: 100%;
+      height: 14px;
+      background: #2b2b2b;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    #atlasFlashUsageInner {
+      width: 0%;
+      height: 100%;
+      background: #00ee91;
+    }
+
+    #atlasFlashPanelActions {
+      display: flex;
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    .atlasFlashPanelAction {
+      flex: 1;
+      border: 0;
+      border-radius: 10px;
+      padding: 11px;
+      font-size: 12px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    #atlasPanelClear {
+      background: #9f2525;
+      color: white;
+    }
+
+    #atlasPanelReturn {
+      background: #303030;
+      color: white;
+    }
+
+    @media(max-width: 520px) {
+      #atlasFrequencyControl {
+        top: 10px;
+        right: 10px;
+      }
+
+      #atlasFrequencyButton {
+        padding: 7px 9px;
+        font-size: 12px;
+      }
+
+      #atlasMainAltitudeControl {
+        top: 68px;
+        right: 10px;
+      }
+
+      #atlasMainAltitudeButton {
+        padding: 7px 9px;
+        font-size: 12px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+  <iframe
+    id="atlasUiFrame"
+    src="/original-ui"
+    title="ATLAS Ground Station"
+  ></iframe>
+
+  <div id="atlasFrequencyControl">
+    <button
+      id="atlasFrequencyButton"
+      type="button"
+      aria-expanded="false"
+    >
+      915 MHz
+    </button>
+
+    <div id="atlasFrequencyMenu"></div>
+
+    <div id="atlasFrequencyStatus">
+      READY
+    </div>
+  </div>
+
+  <div id="atlasMainAltitudeControl">
+    <button
+      id="atlasMainAltitudeButton"
+      type="button"
+      aria-expanded="false"
+    >
+      MAIN -- FT
+    </button>
+
+    <div id="atlasMainAltitudeMenu"></div>
+
+    <div id="atlasMainAltitudeStatus">
+      SYNCING
+    </div>
+  </div>
+
+  <div id="atlasFlashPanelFull">
+    <div id="atlasFlashPanelCard">
+      <h2 style="margin-top:0">ATLAS V2 Flash</h2>
+
+      <div class="atlasFlashPanelRow">
+        <span>Status</span>
+        <span id="atlasPanelStatus">UNKNOWN</span>
+      </div>
+
+      <div class="atlasFlashPanelRow">
+        <span>Used</span>
+        <span id="atlasPanelUsed">--</span>
+      </div>
+
+      <div class="atlasFlashPanelRow">
+        <span>Available</span>
+        <span id="atlasPanelAvailable">--</span>
+      </div>
+
+      <div class="atlasFlashPanelRow">
+        <span>Capacity</span>
+        <span>16 MB W25Q128</span>
+      </div>
+
+      <div class="atlasFlashPanelRow">
+        <span>Erase verification</span>
+        <span id="atlasPanelVerify">NOT RUN</span>
+      </div>
+
+      <div id="atlasFlashUsageOuter">
+        <div id="atlasFlashUsageInner"></div>
+      </div>
+
+      <div id="atlasPanelPercent" style="
+        margin-top:6px;
+        text-align:right;
+        color:#999;
+        font-size:11px;
+        font-weight:800;
+      ">--% full</div>
+
+      <div id="atlasPanelMessage" style="
+        min-height:18px;
+        margin-top:14px;
+        text-align:center;
+        color:#aaa;
+        font-size:12px;
+        font-weight:700;
+      ">Press Flash to read onboard usage.</div>
+
+      <div id="atlasFlashPanelActions">
+        <button class="atlasFlashPanelAction" id="atlasPanelClear" type="button">
+          CLEAR FLASH
+        </button>
+        <button class="atlasFlashPanelAction" id="atlasPanelReturn" type="button">
+          RETURN
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const groups = [
+      {
+        label: "ATLAS presets",
+        values: ["915.0", "921.8"]
+      },
+      {
+        label: "US915 channels 0-63",
+        values: Array.from(
+          { length: 64 },
+          (_, channel) =>
+            (902.3 + channel * 0.2).toFixed(1)
+        )
+      },
+      {
+        label: "US915 channels 64-71",
+        values: Array.from(
+          { length: 8 },
+          (_, channel) =>
+            (903.0 + channel * 1.6).toFixed(1)
+        )
+      },
+      {
+        label: "US915 downlink",
+        values: Array.from(
+          { length: 8 },
+          (_, channel) =>
+            (923.3 + channel * 0.6).toFixed(1)
+        )
+      }
+    ];
+
+    const control =
+      document.getElementById("atlasFrequencyControl");
+
+    const button =
+      document.getElementById("atlasFrequencyButton");
+
+    const menu =
+      document.getElementById("atlasFrequencyMenu");
+
+    const status =
+      document.getElementById("atlasFrequencyStatus");
+
+    const mainAltitudeControl =
+      document.getElementById("atlasMainAltitudeControl");
+
+    const mainAltitudeButton =
+      document.getElementById("atlasMainAltitudeButton");
+
+    const mainAltitudeMenu =
+      document.getElementById("atlasMainAltitudeMenu");
+
+    const mainAltitudeStatus =
+      document.getElementById("atlasMainAltitudeStatus");
+
+const flashPanelFull =
+      document.getElementById("atlasFlashPanelFull");
+
+    const atlasPanelStatus =
+      document.getElementById("atlasPanelStatus");
+
+    const atlasPanelUsed =
+      document.getElementById("atlasPanelUsed");
+
+    const atlasPanelAvailable =
+      document.getElementById("atlasPanelAvailable");
+
+    const atlasPanelVerify =
+      document.getElementById("atlasPanelVerify");
+
+    const atlasPanelPercent =
+      document.getElementById("atlasPanelPercent");
+
+    const atlasFlashUsageInner =
+      document.getElementById("atlasFlashUsageInner");
+
+    const atlasPanelMessage =
+      document.getElementById("atlasPanelMessage");
+
+    const atlasPanelClear =
+      document.getElementById("atlasPanelClear");
+
+    const atlasPanelReturn =
+      document.getElementById("atlasPanelReturn");
+
+    const added =
+      new Set();
+
+    groups.forEach(group => {
+      const label =
+        document.createElement("div");
+
+      label.className =
+        "atlasFrequencyGroup";
+
+      label.innerText =
+        group.label;
+
+      menu.appendChild(label);
+
+      group.values.forEach(frequency => {
+        if (added.has(frequency)) {
+          return;
+        }
+
+        added.add(frequency);
+
+        const option =
+          document.createElement("button");
+
+        option.type = "button";
+        option.className =
+          "atlasFrequencyOption";
+
+        option.dataset.frequency =
+          frequency;
+
+        option.innerText =
+          frequency + " MHz";
+
+        option.addEventListener("click", () => {
+          menu.classList.remove("open");
+
+          button.setAttribute(
+            "aria-expanded",
+            "false"
+          );
+
+          button.disabled = true;
+          status.innerText = "SENDING";
+
+          fetch(
+            "/set-frequency?mhz=" +
+            encodeURIComponent(frequency),
+            {
+              method: "POST"
+            }
+          )
+            .then(response => response.json())
+            .then(result => {
+              if (!result.ok) {
+                throw new Error(
+                  result.message || "Rejected"
+                );
+              }
+
+              status.innerText = "WAITING";
+            })
+            .catch(() => {
+              status.innerText = "FAILED";
+              button.disabled = false;
+            });
+        });
+
+        menu.appendChild(option);
+      });
+    });
+
+    const mainAltitudeValues = [
+      "500",
+      "750",
+      "1000",
+      "1250",
+      "1500",
+      "1750",
+      "2000"
+    ];
+
+    mainAltitudeValues.forEach(altitude => {
+      const option =
+        document.createElement("button");
+
+      option.type = "button";
+      option.className =
+        "atlasMainAltitudeOption";
+
+      option.dataset.altitude =
+        altitude;
+
+      option.innerText =
+        altitude + " ft";
+
+      option.addEventListener("click", () => {
+        mainAltitudeMenu.classList.remove("open");
+
+        mainAltitudeButton.setAttribute(
+          "aria-expanded",
+          "false"
+        );
+
+        mainAltitudeButton.disabled = true;
+        mainAltitudeStatus.innerText = "SENDING";
+
+        fetch(
+          "/set-main-altitude?ft=" +
+          encodeURIComponent(altitude),
+          {
+            method: "POST"
+          }
+        )
+          .then(response => response.json())
+          .then(result => {
+            if (!result.ok) {
+              throw new Error(
+                result.message || "Rejected"
+              );
+            }
+
+            mainAltitudeStatus.innerText = "WAITING";
+          })
+          .catch(() => {
+            mainAltitudeStatus.innerText = "FAILED";
+            mainAltitudeButton.disabled = false;
+          });
+      });
+
+      mainAltitudeMenu.appendChild(option);
+    });
+
+    button.addEventListener("click", event => {
+      event.stopPropagation();
+
+      const opening =
+        !menu.classList.contains("open");
+
+      menu.classList.toggle(
+        "open",
+        opening
+      );
+
+      button.setAttribute(
+        "aria-expanded",
+        opening ? "true" : "false"
+      );
+    });
+
+    mainAltitudeButton.addEventListener("click", event => {
+      event.stopPropagation();
+
+      const opening =
+        !mainAltitudeMenu.classList.contains("open");
+
+      mainAltitudeMenu.classList.toggle(
+        "open",
+        opening
+      );
+
+      mainAltitudeButton.setAttribute(
+        "aria-expanded",
+        opening ? "true" : "false"
+      );
+    });
+
+    document.addEventListener("click", event => {
+      if (!control.contains(event.target)) {
+        menu.classList.remove("open");
+
+        button.setAttribute(
+          "aria-expanded",
+          "false"
+        );
+      }
+
+      if (!mainAltitudeControl.contains(event.target)) {
+        mainAltitudeMenu.classList.remove("open");
+
+        mainAltitudeButton.setAttribute(
+          "aria-expanded",
+          "false"
+        );
+      }
+    });
+
+    function findLoraStrengthCard() {
+      const frame =
+        document.getElementById("atlasUiFrame");
+
+      try {
+        const frameDocument =
+          frame.contentDocument ||
+          frame.contentWindow.document;
+
+        const elements =
+          frameDocument.querySelectorAll("*");
+
+        let titleElement = null;
+
+        for (const element of elements) {
+          const text =
+            element.textContent.trim();
+
+          if (
+            element.children.length === 0 &&
+            (
+              text === "LoRa Link Strength" ||
+              text === "LoRa Strength"
+            )
+          ) {
+            titleElement = element;
+            break;
+          }
+        }
+
+        if (!titleElement) {
+          return null;
+        }
+
+        let card =
+          titleElement.parentElement;
+
+        while (
+          card &&
+          card !== frameDocument.body
+        ) {
+          if (
+            card.textContent.includes("%")
+          ) {
+            return card;
+          }
+
+          card =
+            card.parentElement;
+        }
+      }
+      catch (error) {
+      }
+
+      return null;
+    }
+
+    function addLoraGuide() {
+      const card =
+        findLoraStrengthCard();
+
+      if (!card) {
+        return;
+      }
+
+      const frame =
+        document.getElementById("atlasUiFrame");
+
+      const frameDocument =
+        frame.contentDocument ||
+        frame.contentWindow.document;
+
+      if (!frameDocument.getElementById(
+        "atlasLoraGuideStyles"
+      )) {
+        const style =
+          frameDocument.createElement("style");
+
+        style.id =
+          "atlasLoraGuideStyles";
+
+        style.textContent = `
+          #atlasLoraMeasurements {
+            margin-top: 5px;
+            font-size: 12px;
+            color: #a9a9a9;
+            text-align: center;
+            white-space: nowrap;
+          }
+
+          #atlasLoraGuide {
+            display: none;
+            width: 100%;
+            margin-top: 10px;
+            padding-top: 9px;
+            border-top: 1px solid rgba(255, 255, 255, 0.12);
+          }
+
+          #atlasLoraGuide.open {
+            display: block;
+          }
+
+          .atlasLoraGuideRow {
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            padding: 3px 0;
+            font-size: 10px;
+            line-height: 1.25;
+            color: #a9a9a9;
+          }
+
+          .atlasLoraGuideRow span:first-child {
+            color: #dddddd;
+            font-weight: 800;
+          }
+
+          .atlasLoraGuideRow span:last-child {
+            text-align: right;
+          }
+
+          #atlasLoraHint {
+            margin-top: 5px;
+            font-size: 9px;
+            color: #777777;
+            text-align: center;
+          }
+        `;
+
+        frameDocument.head.appendChild(style);
+      }
+
+      if (!card.querySelector(
+        "#atlasLoraMeasurements"
+      )) {
+        const descendants =
+          card.querySelectorAll("*");
+
+        for (const element of descendants) {
+          if (
+            element.children.length === 0 &&
+            element.textContent.trim() ===
+              "Radio connection quality"
+          ) {
+            element.style.display = "none";
+          }
+        }
+
+        const measurements =
+          frameDocument.createElement("div");
+
+        measurements.id =
+          "atlasLoraMeasurements";
+
+        measurements.textContent =
+          "-- dBm • -- dB SNR";
+
+        card.appendChild(measurements);
+      }
+
+      if (!card.querySelector(
+        "#atlasLoraGuide"
+      )) {
+        const guide =
+          frameDocument.createElement("div");
+
+        guide.id =
+          "atlasLoraGuide";
+
+        guide.innerHTML = `
+          <div class="atlasLoraGuideRow">
+            <span>Excellent</span>
+            <span>&gt; -70 dBm • &gt; +8 dB SNR</span>
+          </div>
+          <div class="atlasLoraGuideRow">
+            <span>Very good</span>
+            <span>-70 to -90 dBm • +4 to +8 dB</span>
+          </div>
+          <div class="atlasLoraGuideRow">
+            <span>Good</span>
+            <span>-90 to -105 dBm • 0 to +4 dB</span>
+          </div>
+          <div class="atlasLoraGuideRow">
+            <span>Weak</span>
+            <span>-105 to -115 dBm • -5 to 0 dB</span>
+          </div>
+          <div class="atlasLoraGuideRow">
+            <span>Near limit</span>
+            <span>&lt; -115 dBm • &lt; -5 dB</span>
+          </div>
+          <div id="atlasLoraHint">
+            Tap the card to close
+          </div>
+        `;
+
+        card.appendChild(guide);
+
+        card.style.cursor =
+          "pointer";
+
+        card.addEventListener(
+          "click",
+          () => {
+            guide.classList.toggle(
+              "open"
+            );
+          }
+        );
+      }
+    }
+
+    function updateLoraDisplay(data) {
+      addLoraGuide();
+
+      const card =
+        findLoraStrengthCard();
+
+      if (!card) {
+        return;
+      }
+
+      const descendants =
+        card.querySelectorAll("*");
+
+      for (const element of descendants) {
+        if (
+          element.children.length === 0 &&
+          element.textContent.trim() ===
+            "Radio connection quality"
+        ) {
+          element.style.display = "none";
+        }
+      }
+
+      const measurements =
+        card.querySelector(
+          "#atlasLoraMeasurements"
+        );
+
+      if (!measurements) {
+        return;
+      }
+
+      const rssi =
+        data.rssi || "--";
+
+      const snr =
+        data.snr || "--";
+
+      measurements.textContent =
+        `${rssi} dBm • ${snr} dB SNR`;
+    }
+
+    document
+      .getElementById("atlasUiFrame")
+      .addEventListener(
+        "load",
+        addLoraGuide
+      );
+
+    function requestFlashInfoPanel() {
+      atlasPanelMessage.innerText =
+        "Reading flash usage...";
+
+      fetch(
+        "/flash-info",
+        { method: "POST" }
+      )
+        .catch(() => {
+          atlasPanelMessage.innerText =
+            "Flash info request failed";
+        });
+    }
+
+    window.addEventListener(
+      "message",
+      event => {
+        if (event.data === "ATLAS_OPEN_FLASH")
+        {
+          flashPanelFull.classList.add("open");
+          requestFlashInfoPanel();
+        }
+      }
+    );
+
+    atlasPanelReturn.addEventListener(
+      "click",
+      () => {
+        flashPanelFull.classList.remove("open");
+      }
+    );
+
+    atlasPanelClear.addEventListener(
+      "click",
+      () => {
+        const confirmed =
+          confirm(
+            "Erase the entire ATLAS V2 W25Q128 flash? The microSD is not touched."
+          );
+
+        if (!confirmed) {
+          return;
+        }
+
+        atlasPanelClear.disabled = true;
+        atlasPanelReturn.disabled = false;
+        atlasPanelStatus.innerText = "COMMAND SENT";
+        atlasPanelMessage.innerText =
+          "Sending erase command...";
+
+        fetch(
+          "/clear-blackbox",
+          { method: "POST" }
+        )
+          .then(response => response.json())
+          .then(result => {
+            if (!result.ok) {
+              throw new Error("Rejected");
+            }
+          })
+          .catch(() => {
+            atlasPanelStatus.innerText = "FAILED";
+            atlasPanelMessage.innerText = "Command failed";
+            atlasPanelClear.disabled = false;
+            atlasPanelReturn.disabled = false;
+          });
+      }
+    );
+
+    function refreshFrequency() {
+      fetch("/data")
+        .then(response => response.json())
+        .then(data => {
+          const frequency =
+            data.frequency || "915.0";
+
+          const state =
+            data.frequencyStatus || "READY";
+
+          const currentFlashStatus =
+            data.flashStatus || "READY";
+
+          const panelUsedBytes =
+            Number(data.flashUsedBytes || 0);
+
+          const panelTotalBytes =
+            Number(data.flashTotalBytes || 16777216);
+
+          const panelAvailableBytes =
+            Math.max(
+              panelTotalBytes - panelUsedBytes,
+              0
+            );
+
+          const panelPercent =
+            panelTotalBytes > 0
+              ? (panelUsedBytes / panelTotalBytes) * 100.0
+              : 0.0;
+
+          atlasPanelStatus.innerText =
+            (data.flashStatus || "READY")
+              .replaceAll("_", " ");
+
+          atlasPanelUsed.innerText =
+            (panelUsedBytes / 1048576.0).toFixed(2) +
+            " MB";
+
+          atlasPanelAvailable.innerText =
+            (panelAvailableBytes / 1048576.0).toFixed(2) +
+            " MB";
+
+          atlasPanelPercent.innerText =
+            panelPercent.toFixed(1) +
+            "% full";
+
+          atlasFlashUsageInner.style.width =
+            Math.min(panelPercent, 100).toFixed(1) +
+            "%";
+
+          const panelVerify =
+            data.flashVerify || "NOT RUN";
+
+          atlasPanelVerify.innerText =
+            panelVerify;
+          atlasPanelVerify.style.color = "#eeeeee";
+
+          const flashPanelBusy =
+            currentFlashStatus === "COMMAND_SENT" ||
+            currentFlashStatus === "CLEARING";
+
+          atlasPanelClear.disabled =
+            flashPanelBusy;
+
+          atlasPanelReturn.disabled = false;
+
+          if (
+            data.flashStatus === "EMPTY" &&
+            panelVerify === "FULL"
+          )
+          {
+            atlasPanelUsed.innerText = "0.00 MB";
+            atlasPanelAvailable.innerText = "16.00 MB";
+            atlasPanelPercent.innerText = "0.0% full";
+            atlasFlashUsageInner.style.width = "0%";
+            atlasPanelVerify.innerText =
+              "FULL ERASE VERIFIED";
+            atlasPanelVerify.style.color =
+              "#00ee91";
+            atlasPanelMessage.innerText =
+              "Flash is empty and ready.";
+            atlasPanelClear.disabled = false;
+            atlasPanelReturn.disabled = false;
+          }
+          else if (data.flashStatus === "CLEARING")
+          {
+            atlasPanelVerify.innerText =
+              "ERASING";
+            atlasPanelVerify.style.color =
+              "#ffba52";
+            atlasPanelMessage.innerText =
+              "Erasing flash... ATLAS V2 is still connected.";
+          }
+          else if (data.flashStatus === "VERIFYING")
+          {
+            atlasPanelVerify.innerText =
+              "VERIFYING";
+            atlasPanelVerify.style.color =
+              "#ffba52";
+            atlasPanelMessage.innerText =
+              "Erase finished. Verifying the full 16 MB...";
+          }
+          else if (
+            data.flashStatus === "FAILED" ||
+            panelVerify === "FAIL"
+          )
+          {
+            atlasPanelVerify.innerText =
+              "FAILED";
+            atlasPanelVerify.style.color =
+              "#ff5d5d";
+            atlasPanelMessage.innerText =
+              "Erase or verification failed.";
+            atlasPanelClear.disabled = false;
+            atlasPanelReturn.disabled = false;
+          }
+
+          if (
+            currentFlashStatus === "READY" &&
+            !flashPanelBusy
+          )
+          {
+            atlasPanelMessage.innerText =
+              "Flash usage loaded.";
+            atlasPanelClear.disabled = false;
+            atlasPanelReturn.disabled = false;
+          }
+
+          else if (
+            currentFlashStatus === "TIMEOUT" ||
+            currentFlashStatus === "SEND_FAILED"
+          )
+          {
+            atlasPanelVerify.innerText = "NOT VERIFIED";
+            atlasPanelVerify.style.color = "#ffba52";
+            atlasPanelMessage.innerText =
+              "No response from ATLAS V2. You can return or try again.";
+            atlasPanelClear.disabled = false;
+            atlasPanelReturn.disabled = false;
+          }
+
+          updateLoraDisplay(data);
+
+          button.innerText =
+            frequency.replace(".0", "") +
+            " MHz";
+
+          status.innerText =
+            state;
+
+          const mainAltitude =
+            data.mainAltitudeFt || "";
+
+          const mainState =
+            data.mainAltitudeStatus || "UNKNOWN";
+
+          mainAltitudeButton.innerText =
+            mainAltitude.length > 0
+              ? "MAIN " + mainAltitude + " FT"
+              : "MAIN -- FT";
+
+          mainAltitudeStatus.innerText =
+            mainState;
+
+          const mainAltitudeBusy = [
+            "SENDING",
+            "WAITING",
+            "PENDING",
+            "COMMAND_SENT",
+            "BUSY"
+          ];
+
+          mainAltitudeButton.disabled =
+            mainAltitudeBusy.includes(mainState);
+
+          document
+            .querySelectorAll(
+              ".atlasMainAltitudeOption"
+            )
+            .forEach(option => {
+              option.classList.toggle(
+                "current",
+                option.dataset.altitude ===
+                  mainAltitude
+              );
+            });
+
+          const frequencyBusy = [
+            "SENDING",
+            "CHANGING",
+            "PENDING",
+            "COMMAND_SENT"
+          ];
+
+          button.disabled =
+            frequencyBusy.includes(state);
+
+          document
+            .querySelectorAll(
+              ".atlasFrequencyOption"
+            )
+            .forEach(option => {
+              option.classList.toggle(
+                "current",
+                option.dataset.frequency ===
+                  frequency
+              );
+            });
+        })
+        .catch(() => {
+          status.innerText = "OFFLINE";
+          button.disabled = false;
+
+          mainAltitudeStatus.innerText = "OFFLINE";
+          mainAltitudeButton.disabled = false;
+        });
+    }
+
+    setInterval(
+      refreshFrequency,
+      500
+    );
+
+    fetch(
+      "/main-altitude-info",
+      { method: "POST" }
+    ).catch(() => {
+      mainAltitudeStatus.innerText = "SYNC FAILED";
+    });
+
+    refreshFrequency();
+  </script>
+
+</body>
+</html>
+)freqpage";
+
+String escapeJson(String value)
+{
+  value.replace("\\", "\\\\");
+  value.replace("\"", "\\\"");
+  value.replace("\n", "\\n");
+  value.replace("\r", "");
+
+  return value;
+}
+
+String getValue(
+  const String& line,
+  const String& key
+)
+{
+  /*
+   * Match whole comma-separated field names only.
+   *
+   * This prevents STATUS from accidentally matching FLASHSTATUS,
+   * ALTFT from matching GPSALTFT, etc.
+   */
+  String token = key + "=";
+
+  int searchFrom = 0;
+
+  while (true)
+  {
+    int start =
+      line.indexOf(
+        token,
+        searchFrom
+      );
+
+    if (start < 0)
+    {
+      return "";
+    }
+
+    bool validBoundary =
+      start == 0 ||
+      line.charAt(start - 1) == ',';
+
+    if (validBoundary)
+    {
+      start += token.length();
+
+      int end =
+        line.indexOf(",", start);
+
+      if (end < 0)
+      {
+        end = line.length();
+      }
+
+      String value =
+        line.substring(
+          start,
+          end
+        );
+
+      value.trim();
+
+      return value;
+    }
+
+    searchFrom =
+      start + token.length();
+  }
+}
+
+bool stringToDouble(
+  const String& value,
+  double& result
+)
+{
+  if (value.length() == 0)
+  {
+    return false;
+  }
+
+  char* endPointer = nullptr;
+
+  result = strtod(
+    value.c_str(),
+    &endPointer
+  );
+
+  if (
+    endPointer == value.c_str() ||
+    *endPointer != '\0'
+  )
+  {
+    return false;
+  }
+
+  return true;
+}
+
+double degreesToRadians(double degrees)
+{
+  return degrees * PI / 180.0;
+}
+
+double radiansToDegrees(double radians)
+{
+  return radians * 180.0 / PI;
+}
+
+double calculateDistanceKm(
+  double lat1,
+  double lon1,
+  double lat2,
+  double lon2
+)
+{
+  const double earthRadiusKm = 6371.0;
+
+  double latitudeDifference =
+    degreesToRadians(lat2 - lat1);
+
+  double longitudeDifference =
+    degreesToRadians(lon2 - lon1);
+
+  double a =
+    sin(latitudeDifference / 2.0) *
+    sin(latitudeDifference / 2.0) +
+    cos(degreesToRadians(lat1)) *
+    cos(degreesToRadians(lat2)) *
+    sin(longitudeDifference / 2.0) *
+    sin(longitudeDifference / 2.0);
+
+  double c =
+    2.0 *
+    atan2(
+      sqrt(a),
+      sqrt(1.0 - a)
+    );
+
+  return earthRadiusKm * c;
+}
+
+double calculateBearingDegrees(
+  double lat1,
+  double lon1,
+  double lat2,
+  double lon2
+)
+{
+  double firstLatitude =
+    degreesToRadians(lat1);
+
+  double secondLatitude =
+    degreesToRadians(lat2);
+
+  double longitudeDifference =
+    degreesToRadians(lon2 - lon1);
+
+  double y =
+    sin(longitudeDifference) *
+    cos(secondLatitude);
+
+  double x =
+    cos(firstLatitude) *
+    sin(secondLatitude) -
+    sin(firstLatitude) *
+    cos(secondLatitude) *
+    cos(longitudeDifference);
+
+  double bearing =
+    radiansToDegrees(
+      atan2(y, x)
+    );
+
+  return fmod(
+    bearing + 360.0,
+    360.0
+  );
+}
+
+String bearingDirection(double bearing)
+{
+  const char* directions[] =
+  {
+    "N",
+    "NE",
+    "E",
+    "SE",
+    "S",
+    "SW",
+    "W",
+    "NW"
+  };
+
+  int index =
+    ((int)round(bearing / 45.0)) % 8;
+
+  return String(directions[index]);
+}
+
+String getContentType(const String& filename)
+{
+  if (filename.endsWith(".html"))
+  {
+    return "text/html";
+  }
+
+  if (filename.endsWith(".css"))
+  {
+    return "text/css";
+  }
+
+  if (filename.endsWith(".js"))
+  {
+    return "application/javascript";
+  }
+
+  if (filename.endsWith(".png"))
+  {
+    return "image/png";
+  }
+
+  if (
+    filename.endsWith(".jpg") ||
+    filename.endsWith(".jpeg")
+  )
+  {
+    return "image/jpeg";
+  }
+
+  if (filename.endsWith(".svg"))
+  {
+    return "image/svg+xml";
+  }
+
+  if (filename.endsWith(".json"))
+  {
+    return "application/json";
+  }
+
+  return "application/octet-stream";
+}
+
+bool serveFileFromSD(String path)
+{
+  if (path == "/")
+  {
+    path = "/index.html";
+  }
+
+  if (path.indexOf("..") >= 0)
+  {
+    server.send(
+      403,
+      "text/plain",
+      "Invalid path"
+    );
+
+    return true;
+  }
+
+  if (!SD.exists(path))
+  {
+    return false;
+  }
+
+  File file = SD.open(
+    path,
+    FILE_READ
+  );
+
+  if (!file)
+  {
+    server.send(
+      500,
+      "text/plain",
+      "Failed to open file"
+    );
+
+    return true;
+  }
+
+  server.sendHeader(
+    "Cache-Control",
+    "no-store"
+  );
+
+  server.streamFile(
+    file,
+    getContentType(path)
+  );
+
+  file.close();
+
+  return true;
+}
+
+void saveField(
+  const String& line,
+  const String& key,
+  String& destination
+)
+{
+  String value = getValue(
+    line,
+    key
+  );
+
+  if (value.length() > 0)
+  {
+    destination = value;
+  }
+}
+
+void parseDataLine(const String& line)
+{
+  if (!line.startsWith("DATA,"))
+  {
+    return;
+  }
+
+  latestLine = line;
+
+  packetCount++;
+
+  lastPacketTime = millis();
+
+  saveField(
+    line,
+    "NAME",
+    trackerName
+  );
+
+  saveField(
+    line,
+    "PKT",
+    pkt
+  );
+
+  /*
+   * Green LED link detection.
+   * Only a DATA line with a real PKT number greater than 0
+   * counts as an onboard packet.
+   *
+   * The GS STM32 startup line uses PKT=0, so it is ignored.
+   * GS battery lines do not enter parseDataLine().
+   */
+  String receivedPkt = getValue(
+    line,
+    "PKT"
+  );
+
+  if (
+    receivedPkt.length() > 0 &&
+    receivedPkt.toInt() > 0
+  )
+  {
+    lastValidPktTime = millis();
+    digitalWrite(GREEN_LED_PIN, HIGH);
+  }
+
+  /*
+   * Main UI altitude must ALWAYS come from the onboard barometer.
+   * The GS STM32 forwards barometric altitude as A1FT.
+   *
+   * Do not search for "ALTFT" here because "ALTFT=" is also a
+   * substring of "GPSALTFT=", which caused the ESP32 to accidentally
+   * use GPS altitude for the main Altitude card.
+   */
+  String receivedAltitude =
+    getValue(
+      line,
+      "A1FT"
+    );
+
+  if (
+    receivedAltitude.length() > 0 &&
+    receivedAltitude != "---"
+  )
+  {
+    altitudeFt =
+      receivedAltitude;
+  }
+
+  /*
+   * Update onboard coordinates only when BOTH new values are valid.
+   * If a later packet has missing/invalid coordinates, keep the
+   * last valid coordinates so the UI and map retain last known position.
+   */
+  String receivedLatitude =
+    getValue(
+      line,
+      "LAT"
+    );
+
+  String receivedLongitude =
+    getValue(
+      line,
+      "LON"
+    );
+
+  double parsedLatitude = 0.0;
+  double parsedLongitude = 0.0;
+
+  bool receivedCoordinatesValid =
+    stringToDouble(
+      receivedLatitude,
+      parsedLatitude
+    ) &&
+    stringToDouble(
+      receivedLongitude,
+      parsedLongitude
+    ) &&
+    parsedLatitude >= -90.0 &&
+    parsedLatitude <= 90.0 &&
+    parsedLongitude >= -180.0 &&
+    parsedLongitude <= 180.0 &&
+    parsedLatitude != 0.0 &&
+    parsedLongitude != 0.0;
+
+  if (receivedCoordinatesValid)
+  {
+    latitude = receivedLatitude;
+    longitude = receivedLongitude;
+  }
+
+  saveField(
+    line,
+    "DESCFTS",
+    descentFtS
+  );
+
+  saveField(
+    line,
+    "SATS",
+    satellites
+  );
+
+  saveField(
+    line,
+    "FIX",
+    gpsFixType
+  );
+
+  saveField(
+    line,
+    "GPSALTFT",
+    gpsAltitudeFt
+  );
+
+  saveField(
+    line,
+    "GPSVSFTS",
+    gpsVerticalSpeedFtS
+  );
+
+  saveField(
+    line,
+    "GPSAGE",
+    gpsAgeMs
+  );
+
+  saveField(
+    line,
+    "BATV",
+    batteryVoltage
+  );
+
+  saveField(
+    line,
+    "GSBATV",
+    groundStationBatteryVoltage
+  );
+
+  saveField(
+    line,
+    "RSSI",
+    loraRssi
+  );
+
+  saveField(
+    line,
+    "SNR",
+    loraSnr
+  );
+
+saveField(
+    line,
+    "RFHZ",
+    actualRadioFrequencyHz
+);
+
+  Serial.println(line);
+}
+
+void parseGroundStationLine(const String& line)
+{
+  if (!line.startsWith("GS,"))
+  {
+    return;
+  }
+
+  String value = getValue(
+    line,
+    "GSBATV"
+  );
+
+  if (value.length() > 0)
+  {
+    groundStationBatteryVoltage =
+      value;
+  }
+
+  String receivedFlashUsed =
+    getValue(
+      line,
+      "USED"
+    );
+
+  String receivedFlashTotal =
+    getValue(
+      line,
+      "TOTAL"
+    );
+
+  if (receivedFlashUsed.length() > 0)
+  {
+    flashUsedBytes =
+      receivedFlashUsed;
+    flashInfoRequestTime = 0;
+  }
+
+  if (receivedFlashTotal.length() > 0)
+  {
+    flashTotalBytes =
+      receivedFlashTotal;
+  }
+
+  String receivedFlashStatus =
+    getValue(
+      line,
+      "FLASHSTATUS"
+    );
+
+  if (receivedFlashStatus.length() > 0)
+  {
+    flashStatus =
+      receivedFlashStatus;
+
+    flashMaintenanceActive =
+      receivedFlashStatus == "COMMAND_SENT" ||
+      receivedFlashStatus == "CLEARING" ||
+      receivedFlashStatus == "VERIFYING";
+
+    String receivedVerify =
+      getValue(
+        line,
+        "VERIFY"
+      );
+
+    String receivedBytes =
+      getValue(
+        line,
+        "BYTES"
+      );
+
+    if (receivedVerify.length() > 0)
+    {
+      flashVerify = receivedVerify;
+    }
+
+    if (receivedBytes.length() > 0)
+    {
+      flashBytes = receivedBytes;
+    }
+
+    if (
+      receivedFlashStatus == "EMPTY" ||
+      receivedFlashStatus == "FAILED" ||
+      receivedFlashStatus == "SEND_FAILED"
+    )
+    {
+      flashMaintenanceActive = false;
+      flashCommandTime = 0;
+
+      if (
+        receivedFlashStatus == "EMPTY" &&
+        flashVerify == "FULL"
+      )
+      {
+        flashUsedBytes = "0";
+        flashTotalBytes = "16777216";
+      }
+    }
+  }
+
+  String receivedMainAltitude =
+    getValue(
+      line,
+      "MAINALTFT"
+    );
+
+  if (
+    receivedMainAltitude.length() > 0 &&
+    receivedMainAltitude != "UNKNOWN"
+  )
+  {
+    currentMainAltitudeFt =
+      receivedMainAltitude;
+  }
+
+  String receivedMainAltitudeStatus =
+    getValue(
+      line,
+      "MAINALTSTATUS"
+    );
+
+  if (receivedMainAltitudeStatus.length() > 0)
+  {
+    if (
+      receivedMainAltitudeStatus == "CHANGED" ||
+      receivedMainAltitudeStatus == "ALREADY_SET" ||
+      receivedMainAltitudeStatus == "OK"
+    )
+    {
+      mainAltitudeStatus = "READY";
+      requestedMainAltitudeFt = "";
+      mainAltitudeCommandTime = 0;
+    }
+    else
+    {
+      mainAltitudeStatus =
+        receivedMainAltitudeStatus;
+
+      if (
+        receivedMainAltitudeStatus == "NO_ACK" ||
+        receivedMainAltitudeStatus == "SEND_FAILED" ||
+        receivedMainAltitudeStatus == "INVALID" ||
+        receivedMainAltitudeStatus == "REJECTED" ||
+        receivedMainAltitudeStatus == "BAD_ACK"
+      )
+      {
+        requestedMainAltitudeFt = "";
+        mainAltitudeCommandTime = 0;
+      }
+    }
+  }
+  else if (
+    line.indexOf("GS,HEALTH,") == 0 &&
+    receivedMainAltitude.length() > 0 &&
+    mainAltitudeCommandTime == 0
+  )
+  {
+    /*
+     * A health response is the authoritative startup sync for the persisted
+     * onboard MAIN altitude.
+     */
+    mainAltitudeStatus = "READY";
+  }
+
+  String receivedFrequency =
+    getValue(
+      line,
+      "FREQ"
+    );
+
+  String receivedStatus =
+    getValue(
+      line,
+      "FREQSTATUS"
+    );
+
+  /*
+   * Some frequency responses may use STATUS= instead of FREQSTATUS=.
+   * getValue() now requires a complete field-name match, so this can
+   * no longer accidentally read FLASHSTATUS=CLEARING/COMMAND_SENT.
+   */
+  if (receivedStatus.length() == 0)
+  {
+    receivedStatus =
+      getValue(
+        line,
+        "STATUS"
+      );
+  }
+
+  if (
+    line.indexOf("FREQACK") >= 0 &&
+    receivedStatus.length() == 0
+  )
+  {
+    receivedStatus =
+      "CHANGED";
+  }
+
+  if (
+    line.indexOf("NO_ACK") >= 0 &&
+    receivedStatus.length() == 0
+  )
+  {
+    receivedStatus =
+      "NO_ACK";
+  }
+
+  if (
+    line.indexOf("INVALID") >= 0 &&
+    receivedStatus.length() == 0
+  )
+  {
+    receivedStatus =
+      "INVALID";
+  }
+
+  if (
+    receivedStatus == "CHANGED" ||
+    receivedStatus == "ALREADY_SET" ||
+    receivedStatus == "SUCCESS" ||
+    receivedStatus == "OK"
+  )
+  {
+    if (receivedFrequency.length() > 0)
+    {
+      currentLoraFrequency =
+        receivedFrequency;
+    }
+    else if (
+      requestedLoraFrequency.length() > 0
+    )
+    {
+      currentLoraFrequency =
+        requestedLoraFrequency;
+    }
+
+    frequencyStatus =
+      "READY";
+
+    requestedLoraFrequency = "";
+    frequencyCommandTime = 0;
+  }
+  else if (receivedStatus.length() > 0)
+  {
+    frequencyStatus =
+      receivedStatus;
+
+    if (
+      receivedStatus == "NO_ACK" ||
+      receivedStatus == "FAILED" ||
+      receivedStatus == "INVALID" ||
+      receivedStatus == "REJECTED"
+    )
+    {
+      requestedLoraFrequency = "";
+      frequencyCommandTime = 0;
+    }
+  }
+
+  Serial.println(line);
+}
+
+void readAtlas()
+{
+  while (AtlasSerial.available())
+  {
+    char receivedCharacter =
+      AtlasSerial.read();
+
+    uartCharCount++;
+
+    if (receivedCharacter == '\n')
+    {
+      inputLine.trim();
+
+      if (inputLine.length() > 0)
+{
+  if (inputLine.startsWith("DATA,"))
+  {
+    parseDataLine(inputLine);
+  }
+  else if (inputLine.startsWith("GS,"))
+  {
+    parseGroundStationLine(inputLine);
+  }
+}
+
+      inputLine = "";
+    }
+    else if (receivedCharacter != '\r')
+    {
+      inputLine +=
+        receivedCharacter;
+
+      if (inputLine.length() > 350)
+      {
+        inputLine = "";
+      }
+    }
+  }
+}
+
+void readGroundGps()
+{
+  while (GroundGpsSerial.available())
+  {
+    groundGps.encode(
+      GroundGpsSerial.read()
+    );
+  }
+
+  if (
+    groundGps.location.isUpdated() &&
+    groundGps.location.isValid()
+  )
+  {
+    groundLatitude =
+      groundGps.location.lat();
+
+    groundLongitude =
+      groundGps.location.lng();
+
+    groundLastFixTime =
+      millis();
+  }
+}
+
+void handleRoot()
+{
+  server.send_P(
+    200,
+    "text/html",
+    FREQUENCY_WRAPPER_PAGE
+  );
+}
+
+void handleOriginalUi()
+{
+  if (!serveFileFromSD("/index.html"))
+  {
+    server.send(
+      404,
+      "text/plain",
+      "index.html not found"
+    );
+  }
+}
+
+void handleData()
+{
+  unsigned long age = 0;
+
+  if (lastPacketTime > 0)
+  {
+    age =
+      millis() - lastPacketTime;
+  }
+
+  bool groundFixValid =
+    groundLastFixTime > 0 &&
+    millis() - groundLastFixTime <
+    GS_FIX_TIMEOUT_MS;
+
+  double onboardLatitude = 0.0;
+  double onboardLongitude = 0.0;
+
+  bool onboardLatitudeValid =
+    stringToDouble(
+      latitude,
+      onboardLatitude
+    );
+
+  bool onboardLongitudeValid =
+    stringToDouble(
+      longitude,
+      onboardLongitude
+    );
+
+  bool onboardFixValid =
+    onboardLatitudeValid &&
+    onboardLongitudeValid &&
+    onboardLatitude >= -90.0 &&
+    onboardLatitude <= 90.0 &&
+    onboardLongitude >= -180.0 &&
+    onboardLongitude <= 180.0 &&
+    onboardLatitude != 0.0 &&
+    onboardLongitude != 0.0;
+
+  double distanceKm = 0.0;
+  double distanceM = 0.0;
+  double bearingDegrees = 0.0;
+
+  String direction = "";
+
+  if (
+    groundFixValid &&
+    onboardFixValid
+  )
+  {
+    distanceKm =
+      calculateDistanceKm(
+        groundLatitude,
+        groundLongitude,
+        onboardLatitude,
+        onboardLongitude
+      );
+
+    distanceM =
+      distanceKm * 1000.0;
+
+    bearingDegrees =
+      calculateBearingDegrees(
+        groundLatitude,
+        groundLongitude,
+        onboardLatitude,
+        onboardLongitude
+      );
+
+    direction =
+      bearingDirection(
+        bearingDegrees
+      );
+  }
+
+  uint32_t groundSatellites = 0;
+
+  if (groundGps.satellites.isValid())
+  {
+    groundSatellites =
+      groundGps.satellites.value();
+  }
+
+  double groundHdop = 0.0;
+
+  if (groundGps.hdop.isValid())
+  {
+    groundHdop =
+      groundGps.hdop.hdop();
+  }
+
+  unsigned long groundFixAge = 0;
+
+  if (groundGps.location.isValid())
+  {
+    groundFixAge =
+      groundGps.location.age();
+  }
+
+  String json = "{";
+
+  json += "\"latest\":\"";
+  json += escapeJson(latestLine);
+  json += "\",";
+
+  json += "\"name\":\"";
+  json += escapeJson(trackerName);
+  json += "\",";
+
+  json += "\"count\":";
+  json += String(packetCount);
+  json += ",";
+
+  json += "\"age\":";
+  json += String(age);
+  json += ",";
+
+  json += "\"timeout\":";
+  json += String(LINK_TIMEOUT_MS);
+  json += ",";
+
+  json += "\"pkt\":\"";
+  json += escapeJson(pkt);
+  json += "\",";
+
+  json += "\"altft\":\"";
+  json += escapeJson(altitudeFt);
+  json += "\",";
+
+  json += "\"lat\":\"";
+  json += escapeJson(latitude);
+  json += "\",";
+
+  json += "\"lon\":\"";
+  json += escapeJson(longitude);
+  json += "\",";
+
+  json += "\"descfts\":\"";
+  json += escapeJson(descentFtS);
+  json += "\",";
+
+  json += "\"sats\":\"";
+  json += escapeJson(satellites);
+  json += "\",";
+
+  json += "\"gpsfix\":\"";
+  json += escapeJson(gpsFixType);
+  json += "\",";
+
+  json += "\"gpsaltft\":\"";
+  json += escapeJson(gpsAltitudeFt);
+  json += "\",";
+
+  json += "\"gpsvsfts\":\"";
+  json += escapeJson(gpsVerticalSpeedFtS);
+  json += "\",";
+
+  json += "\"gpsage\":\"";
+  json += escapeJson(gpsAgeMs);
+  json += "\",";
+
+  json += "\"batv\":\"";
+  json += escapeJson(batteryVoltage);
+  json += "\",";
+
+  json += "\"gsbatv\":\"";
+  json += escapeJson(
+    groundStationBatteryVoltage
+  );
+  json += "\",";
+
+  json += "\"rssi\":\"";
+  json += escapeJson(loraRssi);
+  json += "\",";
+
+  json += "\"snr\":\"";
+  json += escapeJson(loraSnr);
+  json += "\",";
+
+  json += "\"gsFix\":";
+  json += groundFixValid
+    ? "true"
+    : "false";
+  json += ",";
+
+  json += "\"gsLat\":";
+  json += groundFixValid
+    ? String(groundLatitude, 6)
+    : "0";
+  json += ",";
+
+  json += "\"gsLon\":";
+  json += groundFixValid
+    ? String(groundLongitude, 6)
+    : "0";
+  json += ",";
+
+  json += "\"gsSats\":";
+  json += String(groundSatellites);
+  json += ",";
+
+  json += "\"gsHdop\":";
+  json += String(groundHdop, 2);
+  json += ",";
+
+  json += "\"gsFixAge\":";
+  json += String(groundFixAge);
+  json += ",";
+
+  json += "\"onboardFix\":";
+  json += onboardFixValid
+    ? "true"
+    : "false";
+  json += ",";
+
+  json += "\"distanceKm\":";
+  json += String(distanceKm, 3);
+  json += ",";
+
+  json += "\"distanceM\":";
+  json += String(distanceM, 1);
+  json += ",";
+
+  json += "\"bearingDeg\":";
+  json += String(bearingDegrees, 1);
+  json += ",";
+
+  json += "\"bearingDirection\":\"";
+  json += escapeJson(direction);
+  json += "\",";
+
+  json += "\"frequency\":\"";
+json += escapeJson(
+    currentLoraFrequency
+);
+json += "\",";
+
+String actualRadioFrequencyMHz = "--";
+
+if (actualRadioFrequencyHz.length() > 0)
+{
+    actualRadioFrequencyMHz =
+        String(
+            actualRadioFrequencyHz.toDouble() / 1000000.0,
+            3
+        );
+}
+
+json += "\"radioFrequency\":\"";
+json += escapeJson(
+    actualRadioFrequencyMHz
+);
+json += "\",";
+
+json += "\"frequencyStatus\":\"";
+json += escapeJson(
+    frequencyStatus
+);
+
+json += "\",";
+
+json += "\"mainAltitudeFt\":\"";
+json += escapeJson(
+    currentMainAltitudeFt
+);
+json += "\",";
+
+json += "\"mainAltitudeStatus\":\"";
+json += escapeJson(
+    mainAltitudeStatus
+);
+json += "\",";
+
+  json += "\"flashMaintenance\":";
+  json += flashMaintenanceActive
+    ? "true"
+    : "false";
+  json += ",";
+
+  json += "\"flashStatus\":\"";
+  json += escapeJson(
+    flashStatus
+  );
+  json += "\",";
+
+  json += "\"flashVerify\":\"";
+  json += escapeJson(
+    flashVerify
+  );
+  json += "\",";
+
+  json += "\"flashBytes\":\"";
+  json += escapeJson(
+    flashBytes
+  );
+  json += "\",";
+
+  json += "\"flashUsedBytes\":\"";
+  json += escapeJson(
+    flashUsedBytes
+  );
+  json += "\",";
+
+  json += "\"flashTotalBytes\":\"";
+  json += escapeJson(
+    flashTotalBytes
+  );
+  json += "\",";
+
+  json += "\"chars\":";
+  json += String(uartCharCount);
+
+  json += "}";
+
+  server.sendHeader(
+    "Cache-Control",
+    "no-store"
+  );
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+}
+
+bool validFrequency(
+  const String& frequency
+)
+{
+  double mhz =
+    frequency.toDouble();
+
+  if (
+    frequency == "915.0" ||
+    frequency == "921.8"
+  )
+  {
+    return true;
+  }
+
+  for (
+    int channel = 0;
+    channel < 64;
+    channel++
+  )
+  {
+    double channelMhz =
+      902.3 +
+      channel * 0.2;
+
+    if (
+      fabs(
+        mhz - channelMhz
+      ) < 0.01
+    )
+    {
+      return true;
+    }
+  }
+
+  for (
+    int channel = 0;
+    channel < 8;
+    channel++
+  )
+  {
+    double channelMhz =
+      903.0 +
+      channel * 1.6;
+
+    if (
+      fabs(
+        mhz - channelMhz
+      ) < 0.01
+    )
+    {
+      return true;
+    }
+  }
+
+  for (
+    int channel = 0;
+    channel < 8;
+    channel++
+  )
+  {
+    double channelMhz =
+      923.3 +
+      channel * 0.6;
+
+    if (
+      fabs(
+        mhz - channelMhz
+      ) < 0.01
+    )
+    {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void handleSetFrequency()
+{
+  if (!server.hasArg("mhz"))
+  {
+    server.send(
+      400,
+      "application/json",
+      "{\"ok\":false,\"message\":\"Missing frequency\"}"
+    );
+
+    return;
+  }
+
+  String requestedFrequency =
+    server.arg("mhz");
+
+  requestedFrequency.trim();
+
+  if (!validFrequency(
+    requestedFrequency
+  ))
+  {
+    server.send(
+      400,
+      "application/json",
+      "{\"ok\":false,\"message\":\"Invalid frequency\"}"
+    );
+
+    return;
+  }
+
+  if (
+    requestedFrequency ==
+    currentLoraFrequency
+  )
+  {
+    frequencyStatus =
+      "ALREADY_SET";
+
+    server.send(
+      200,
+      "application/json",
+      "{\"ok\":true,\"message\":\"Frequency already selected\"}"
+    );
+
+    return;
+  }
+
+  uint32_t frequencyHz =
+    (uint32_t)llround(
+      requestedFrequency.toDouble() *
+      1000000.0
+    );
+
+  requestedLoraFrequency =
+    requestedFrequency;
+
+  frequencyStatus =
+    "PENDING";
+
+  frequencyCommandTime =
+    millis();
+
+  AtlasSerial.printf(
+  "SETFREQ,%lu\r\n",
+  (unsigned long)frequencyHz
+);
+
+Serial.printf(
+  "Sent to GS STM32: SETFREQ,%lu\n",
+  (unsigned long)frequencyHz
+);
+
+  server.send(
+    200,
+    "application/json",
+    "{\"ok\":true,\"message\":\"Frequency command sent\"}"
+  );
+}
+
+void handleSetMainAltitude()
+{
+  if (!server.hasArg("ft"))
+  {
+    server.send(
+      400,
+      "application/json",
+      "{\"ok\":false,\"message\":\"Missing altitude\"}"
+    );
+
+    return;
+  }
+
+  String requestedAltitude =
+    server.arg("ft");
+
+  requestedAltitude.trim();
+
+  if (requestedAltitude.length() == 0)
+  {
+    server.send(
+      400,
+      "application/json",
+      "{\"ok\":false,\"message\":\"Invalid altitude\"}"
+    );
+
+    return;
+  }
+
+  for (size_t i = 0; i < requestedAltitude.length(); i++)
+  {
+    if (!isDigit(requestedAltitude.charAt(i)))
+    {
+      server.send(
+        400,
+        "application/json",
+        "{\"ok\":false,\"message\":\"Invalid altitude\"}"
+      );
+
+      return;
+    }
+  }
+
+  uint32_t altitudeFt =
+    (uint32_t)requestedAltitude.toInt();
+
+  if (
+    altitudeFt < 100UL ||
+    altitudeFt > 10000UL
+  )
+  {
+    server.send(
+      400,
+      "application/json",
+      "{\"ok\":false,\"message\":\"Altitude must be 100-10000 ft\"}"
+    );
+
+    return;
+  }
+
+  if (
+    requestedMainAltitudeFt.length() > 0 &&
+    mainAltitudeCommandTime > 0
+  )
+  {
+    server.send(
+      409,
+      "application/json",
+      "{\"ok\":false,\"message\":\"MAIN altitude command already pending\"}"
+    );
+
+    return;
+  }
+
+  if (
+    currentMainAltitudeFt.length() > 0 &&
+    requestedAltitude ==
+      currentMainAltitudeFt
+  )
+  {
+    mainAltitudeStatus = "READY";
+
+    server.send(
+      200,
+      "application/json",
+      "{\"ok\":true,\"message\":\"MAIN altitude already selected\"}"
+    );
+
+    return;
+  }
+
+  requestedMainAltitudeFt =
+    requestedAltitude;
+
+  mainAltitudeStatus =
+    "PENDING";
+
+  mainAltitudeCommandTime =
+    millis();
+
+  AtlasSerial.printf(
+    "SETMAINALT,%lu\r\n",
+    (unsigned long)altitudeFt
+  );
+
+  Serial.printf(
+    "Sent to GS STM32: SETMAINALT,%lu\n",
+    (unsigned long)altitudeFt
+  );
+
+  server.send(
+    200,
+    "application/json",
+    "{\"ok\":true,\"message\":\"MAIN altitude command sent\"}"
+  );
+}
+
+void handleMainAltitudeInfo()
+{
+  AtlasSerial.print(
+    "HEALTH\r\n"
+  );
+
+  mainAltitudeStatus =
+    currentMainAltitudeFt.length() > 0
+      ? mainAltitudeStatus
+      : "SYNCING";
+
+  server.send(
+    200,
+    "application/json",
+    "{\"ok\":true,\"message\":\"MAIN altitude sync requested\"}"
+  );
+}
+
+void handleFlashInfo()
+{
+  AtlasSerial.print(
+    "FLASHINFO\r\n"
+  );
+
+  flashInfoRequestTime = millis();
+
+  server.send(
+    200,
+    "application/json",
+    "{\"ok\":true,\"message\":\"Flash info requested\"}"
+  );
+}
+
+void handleClearBlackBox()
+{
+  if (
+    flashStatus == "COMMAND_SENT" ||
+    flashStatus == "CLEARING"
+  )
+  {
+    server.send(
+      409,
+      "application/json",
+      "{\"ok\":false,\"message\":\"Flash clear already in progress\"}"
+    );
+
+    return;
+  }
+
+  /*
+   * Send the exact confirmation token to ATLAS V1.
+   * ATLAS V1 and ATLAS V2 both require the explicit token.
+   */
+  AtlasSerial.print(
+    "CLEARFLASH,CONFIRM=ERASE_W25Q128\r\n"
+  );
+
+  flashStatus = "COMMAND_SENT";
+  flashMaintenanceActive = true;
+  flashCommandTime = millis();
+
+  Serial.println(
+    "Sent to GS STM32: CLEARFLASH,CONFIRM=ERASE_W25Q128"
+  );
+
+  server.send(
+    200,
+    "application/json",
+    "{\"ok\":true,\"message\":\"Flash clear command sent\"}"
+  );
+}
+
+void handleNotFound()
+{
+  String requestedPath =
+    server.uri();
+
+  if (serveFileFromSD(requestedPath))
+  {
+    return;
+  }
+
+  server.send(
+    404,
+    "text/plain",
+    "File not found: " +
+    requestedPath
+  );
+}
+
+void updateStatusLeds()
+{
+  /* Yellow means the ESP32 board is powered and running. */
+  digitalWrite(YELLOW_LED_PIN, HIGH);
+
+  /*
+   * Green means a valid onboard packet number has been seen recently.
+   * DATA,PKT=0 is ignored.
+   * GS battery UART messages do not affect this LED.
+   */
+  bool pktFresh =
+    lastValidPktTime > 0 &&
+    (millis() - lastValidPktTime <= PKT_LED_TIMEOUT_MS);
+
+  digitalWrite(
+    GREEN_LED_PIN,
+    pktFresh ? HIGH : LOW
+  );
+}
+
+void startAtlasAccessPoint()
+{
+  WiFi.mode(WIFI_AP);
+
+  IPAddress localIP(
+    192,
+    168,
+    4,
+    1
+  );
+
+  IPAddress gateway(
+    192,
+    168,
+    4,
+    1
+  );
+
+  IPAddress subnet(
+    255,
+    255,
+    255,
+    0
+  );
+
+  if (!WiFi.softAPConfig(
+    localIP,
+    gateway,
+    subnet
+  ))
+  {
+    Serial.println(
+      "ATLAS AP IP configuration failed"
+    );
+  }
+
+  bool started =
+    WiFi.softAP(
+      AP_NAME,
+      AP_PASS
+    );
+
+  if (started)
+  {
+    Serial.println();
+
+    Serial.println(
+      "ATLAS Ground Station WiFi started"
+    );
+
+    Serial.print(
+      "WiFi: "
+    );
+
+    Serial.println(
+      AP_NAME
+    );
+
+    Serial.print(
+      "IP: "
+    );
+
+    Serial.println(
+      WiFi.softAPIP()
+    );
+
+    Serial.println(
+      "Open: http://192.168.4.1"
+    );
+  }
+  else
+  {
+    Serial.println(
+      "ERROR: ATLAS WiFi failed to start"
+    );
+  }
+}
+
+void setup()
+{
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  pinMode(YELLOW_LED_PIN, OUTPUT);
+
+  digitalWrite(GREEN_LED_PIN, LOW);
+  digitalWrite(YELLOW_LED_PIN, HIGH);
+
+  Serial.begin(115200);
+
+  delay(1500);
+
+  Serial.println();
+
+  Serial.println(
+    "ATLAS Ground Station Starting"
+  );
+
+  AtlasSerial.begin(
+    ATLAS_BAUD,
+    SERIAL_8N1,
+    ATLAS_RX_PIN,
+    ATLAS_TX_PIN
+  );
+
+  GroundGpsSerial.begin(
+    GS_GPS_BAUD,
+    SERIAL_8N1,
+    GS_GPS_RX_PIN,
+    GS_GPS_TX_PIN
+  );
+
+  sdSPI.begin(
+    SD_SCK_PIN,
+    SD_MISO_PIN,
+    SD_MOSI_PIN,
+    SD_CS_PIN
+  );
+
+  Serial.println(
+    "Starting microSD card"
+  );
+
+  if (!SD.begin(
+    SD_CS_PIN,
+    sdSPI,
+    10000000
+  ))
+  {
+    Serial.println(
+      "microSD initialization failed"
+    );
+
+    return;
+  }
+
+  Serial.println(
+    "microSD initialized"
+  );
+
+  if (SD.exists("/index.html"))
+  {
+    Serial.println(
+      "index.html found"
+    );
+  }
+  else
+  {
+    Serial.println(
+      "ERROR: index.html missing"
+    );
+  }
+
+  startAtlasAccessPoint();
+
+  if (MDNS.begin("atlas"))
+  {
+    Serial.println(
+      "Open: http://atlas.local"
+    );
+  }
+  else
+  {
+    Serial.println(
+      "mDNS failed"
+    );
+  }
+
+  server.on(
+    "/",
+    HTTP_GET,
+    handleRoot
+  );
+
+  server.on(
+    "/original-ui",
+    HTTP_GET,
+    handleOriginalUi
+  );
+
+  server.on(
+    "/data",
+    HTTP_GET,
+    handleData
+  );
+
+  server.on(
+  "/set-frequency",
+  HTTP_POST,
+  handleSetFrequency
+);
+
+server.on(
+  "/set-main-altitude",
+  HTTP_POST,
+  handleSetMainAltitude
+);
+
+server.on(
+  "/main-altitude-info",
+  HTTP_POST,
+  handleMainAltitudeInfo
+);
+
+server.on(
+  "/flash-info",
+  HTTP_POST,
+  handleFlashInfo
+);
+
+server.on(
+  "/clear-blackbox",
+  HTTP_POST,
+  handleClearBlackBox
+);
+
+server.onNotFound(
+  handleNotFound
+);
+  server.begin();
+  Serial.println(
+    "Web server started"
+  );
+}
+
+void loop()
+{
+  updateStatusLeds();
+  readAtlas();
+  readGroundGps();
+
+  if (
+    frequencyCommandTime > 0 &&
+    millis() - frequencyCommandTime >
+    FREQUENCY_COMMAND_TIMEOUT_MS
+  )
+  {
+    frequencyStatus =
+      "TIMEOUT";
+
+    requestedLoraFrequency = "";
+    frequencyCommandTime = 0;
+  }
+
+  if (
+    mainAltitudeCommandTime > 0 &&
+    millis() - mainAltitudeCommandTime >
+      MAIN_ALTITUDE_COMMAND_TIMEOUT_MS
+  )
+  {
+    mainAltitudeStatus =
+      "TIMEOUT";
+
+    requestedMainAltitudeFt = "";
+    mainAltitudeCommandTime = 0;
+  }
+
+  if (
+    flashInfoRequestTime > 0 &&
+    millis() - flashInfoRequestTime > 2500UL
+  )
+  {
+    flashInfoRequestTime = 0;
+  }
+
+  if (
+    flashCommandTime > 0 &&
+    millis() - flashCommandTime >
+    FLASH_COMMAND_TIMEOUT_MS
+  )
+  {
+    flashStatus = "TIMEOUT";
+    flashVerify = "NOT RUN";
+    flashMaintenanceActive = false;
+    flashCommandTime = 0;
+  }
+  server.handleClient();
+}
