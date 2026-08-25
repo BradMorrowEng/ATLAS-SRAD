@@ -99,8 +99,30 @@ UART_HandleTypeDef huart1;
 #define RECOVERY_SD_GPS_INTERVAL_MS                5000UL
 #define RECOVERY_SD_POWER_INTERVAL_MS              5000UL
 #define RECOVERY_SD_SYNC_INTERVAL_MS               5000UL
+#define RECOVERY_SD_KALMAN_INTERVAL_MS               1000UL
 #define SDLOG_START_RETRY_INTERVAL_MS                 5000UL
 #define FLIGHT_SENSOR_HEALTH_RECHECK_MS                100UL
+
+/* ==========================================================================
+ * ATLAS V2 1D vertical Kalman estimator, SHADOW MODE ONLY
+ *
+ * State: [altitude_ft, vertical_velocity_ft_s], positive velocity = up.
+ * Barometer: altitude measurement.
+ * Accelerometer: prediction input during ASCENT/COAST only.
+ *
+ * IMPORTANT: ATLAS currently has no full attitude solution. The acceleration
+ * input projects the ADXL372 vector onto the world-up direction learned from
+ * the 1 g vector on the pad. That direction is treated as fixed in the sensor
+ * frame through ascent/coast. Keep this estimator out of deployment authority
+ * until flight data confirms the model or attitude tracking is added.
+ * ========================================================================== */
+#define KALMAN_GRAVITY_FTPS2                     32.17405f
+#define KALMAN_BARO_SIGMA_FT                     15.0f
+#define KALMAN_ACCEL_PROCESS_SIGMA_FTPS2          30.0f
+#define KALMAN_MODEL_PROCESS_SIGMA_FTPS2          80.0f
+#define KALMAN_MAX_PREDICT_STEP_S                  0.05f
+#define KALMAN_PAD_1G_MIN_MG                        700UL
+#define KALMAN_PAD_1G_MAX_MG                       1300UL
 
 #define ATLAS_IWDG_PRESCALER_BITS                         6U
 #define ATLAS_IWDG_RELOAD_VALUE                         999U
@@ -226,7 +248,9 @@ UART_HandleTypeDef huart1;
 #define SDLOG_TYPE_POWER             5U
 #define SDLOG_TYPE_EVENT             6U
 #define SDLOG_TYPE_FLIGHT_TRACE      7U
+#define SDLOG_TYPE_KALMAN            8U
 #define SDLOG_IMU_INTERVAL_MS        5UL    /* 200 Hz */
+#define SDLOG_KALMAN_INTERVAL_MS     20UL   /* 50 Hz shadow-estimator log */
 #define SDLOG_HIGHG_INTERVAL_MS      2UL    /* 500 Hz */
 #define SDLOG_BARO_INTERVAL_MS       100UL  /* 10 Hz */
 #define SDLOG_GPS_INTERVAL_MS        250UL  /* 4 Hz */
@@ -262,6 +286,7 @@ static int32_t baro_filtered_alt_ft10 = 0;
 static int32_t baro_descent_ft10s = 0;
 static int32_t baro_raw_vertical_speed_ft10s = 0;
 static uint32_t baro_velocity_sample_sequence = 0;
+static uint32_t baro_measurement_sequence = 0;
 static uint8_t baro_filter_ready = 0;
 static uint32_t baro_velocity_time_ms = 0;
 static int32_t baro_velocity_alt_ft10 = 0;
@@ -299,6 +324,12 @@ typedef enum
    FLIGHT_MAIN_TRIGGER_ALTITUDE,
    FLIGHT_MAIN_TRIGGER_EXCESSIVE_DESCENT
 } FlightMainTrigger_t;
+typedef enum
+{
+   KALMAN_ACCEL_MODE_NONE = 0,
+   KALMAN_ACCEL_MODE_ASCENT,
+   KALMAN_ACCEL_MODE_COAST
+} KalmanAccelMode_t;
 #define FLIGHT_FLAG_LAUNCH              (1UL << 0)
 #define FLIGHT_FLAG_BURNOUT             (1UL << 1)
 #define FLIGHT_FLAG_BARO_TRUSTED        (1UL << 2)
@@ -364,6 +395,31 @@ static uint32_t flight_powered_peak_mg = 0;
 static uint32_t flight_gyro_mag_dps10 = 0;
 static int32_t flight_max_alt_ft10 = 0;
 static int32_t flight_landing_reference_alt_ft10 = 0;
+
+/* Shadow Kalman estimator state. Nothing below has deployment authority. */
+static uint8_t kalman_initialized = 0;
+static float kalman_altitude_ft = 0.0f;
+static float kalman_velocity_ft_s = 0.0f;
+static float kalman_p00 = 0.0f;
+static float kalman_p01 = 0.0f;
+static float kalman_p10 = 0.0f;
+static float kalman_p11 = 0.0f;
+static float kalman_one_g_mg = 1000.0f;
+static float kalman_axis_avg_x_mg = 0.0f;
+static float kalman_axis_avg_y_mg = 0.0f;
+static float kalman_axis_avg_z_mg = 0.0f;
+static float kalman_axis_unit_x = 0.0f;
+static float kalman_axis_unit_y = 0.0f;
+static float kalman_axis_unit_z = 1.0f;
+static uint8_t kalman_axis_ready = 0;
+static float kalman_last_accel_ft_s2 = 0.0f;
+static uint32_t kalman_last_ms = 0;
+static uint32_t kalman_last_baro_sequence = 0;
+static uint32_t kalman_last_accel_mag_mg = 0;
+static uint8_t kalman_last_accel_source = 0;
+static uint8_t kalman_last_baro_update_used = 0;
+static KalmanAccelMode_t kalman_last_accel_mode = KALMAN_ACCEL_MODE_NONE;
+
 typedef struct
 {
    uint8_t present;
@@ -648,6 +704,20 @@ typedef struct __attribute__((packed))
    uint8_t pyro_arm_would_be_high;
    uint8_t pyro_fire_would_be_high;
 } SDLogFlightTracePayload_t;
+typedef struct __attribute__((packed))
+{
+   int32_t altitude_ft10;
+   int32_t vertical_speed_ft10s;
+   int32_t accel_ft100s2;
+   int32_t baro_alt_ft10;
+   uint32_t accel_mag_mg;
+   uint16_t one_g_mg;
+   uint8_t accel_mode;
+   uint8_t accel_source;
+   uint8_t baro_update_used;
+   uint8_t baro_trusted;
+   char flight_state[16];
+} SDLogKalmanPayload_t;
 _Static_assert(sizeof(SDLogHeader_t) == SDLOG_HEADER_SIZE,
               "SDLogHeader_t must be 128 bytes");
 _Static_assert(sizeof(SDLogRecord_t) == SDLOG_RECORD_SIZE,
@@ -666,6 +736,8 @@ _Static_assert(sizeof(SDLogEventPayload_t) <= 46,
               "Flight event payload too large");
 _Static_assert(sizeof(SDLogFlightTracePayload_t) <= 46,
               "Flight trace payload too large");
+_Static_assert(sizeof(SDLogKalmanPayload_t) <= 46,
+              "Kalman payload too large");
 static uint8_t blackbox_ok = 0;
 static uint32_t blackbox_next_address = BLACKBOX_START_ADDR;
 static uint32_t blackbox_session_number = 0;
@@ -683,6 +755,7 @@ static uint32_t sdlog_last_highg_ms = 0;
 static uint32_t sdlog_last_baro_ms = 0;
 static uint32_t sdlog_last_gps_ms = 0;
 static uint32_t sdlog_last_power_ms = 0;
+static uint32_t sdlog_last_kalman_ms = 0;
 static uint32_t sdlog_last_sync_ms = 0;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -730,6 +803,25 @@ static uint32_t FlightLogic_VectorMagnitude(
    int32_t y,
    int32_t z
 );
+/* Shadow vertical Kalman estimator. */
+static void Kalman_Init(uint32_t now_ms, float initial_altitude_ft);
+static void Kalman_Service(uint32_t now_ms,
+                           int32_t accel_x_mg,
+                           int32_t accel_y_mg,
+                           int32_t accel_z_mg,
+                           uint32_t accel_mag_mg,
+                           uint8_t accel_valid,
+                           uint8_t accel_source);
+static void Kalman_PredictStep(float dt_s,
+                               float accel_ft_s2,
+                               float accel_sigma_ft_s2);
+static void Kalman_UpdateBaro(float measured_altitude_ft);
+static float Kalman_ComputeVerticalAcceleration(int32_t accel_x_mg,
+                                                 int32_t accel_y_mg,
+                                                 int32_t accel_z_mg,
+                                                 uint8_t accel_valid,
+                                                 KalmanAccelMode_t *mode);
+static int32_t Kalman_ScaleFloat(float value, float scale);
 static int16_t SaturateI32ToI16(int32_t value);
 static void ATLAS_WatchdogInit(void);
 static void ATLAS_WatchdogKick(void);
@@ -1045,6 +1137,7 @@ static uint8_t SDLOG_Start(void)
    sdlog_last_baro_ms = now_ms;
    sdlog_last_gps_ms = now_ms;
    sdlog_last_power_ms = now_ms;
+   sdlog_last_kalman_ms = now_ms;
    sdlog_last_sync_ms = now_ms;
    if (!SDLOG_WriteHeader())
    {
@@ -1451,6 +1544,57 @@ static void SDLOG_LogPower(uint32_t now_ms)
        sdlog_ok = 0;
    }
 }
+static void SDLOG_LogKalman(uint32_t now_ms)
+{
+   SDLogKalmanPayload_t payload;
+   memset(
+       &payload,
+       0,
+       sizeof(payload)
+   );
+   payload.altitude_ft10 =
+       Kalman_ScaleFloat(kalman_altitude_ft, 10.0f);
+   payload.vertical_speed_ft10s =
+       Kalman_ScaleFloat(kalman_velocity_ft_s, 10.0f);
+   payload.accel_ft100s2 =
+       Kalman_ScaleFloat(kalman_last_accel_ft_s2, 100.0f);
+   payload.baro_alt_ft10 = baro_alt_ft10;
+   payload.accel_mag_mg = kalman_last_accel_mag_mg;
+   if (kalman_one_g_mg < 0.0f)
+   {
+       payload.one_g_mg = 0;
+   }
+   else if (kalman_one_g_mg > 65535.0f)
+   {
+       payload.one_g_mg = 65535U;
+   }
+   else
+   {
+       payload.one_g_mg = (uint16_t)(kalman_one_g_mg + 0.5f);
+   }
+   payload.accel_mode = (uint8_t)kalman_last_accel_mode;
+   payload.accel_source = kalman_last_accel_source;
+   payload.baro_update_used = kalman_last_baro_update_used;
+   payload.baro_trusted = flight_baro_trusted;
+   snprintf(
+       payload.flight_state,
+       sizeof(payload.flight_state),
+       "%s",
+       FlightLogic_StateName(flight_state)
+   );
+   if (
+       !SDLOG_AppendRecord(
+           SDLOG_TYPE_KALMAN,
+           now_ms,
+           kalman_initialized ? 1U : 0U,
+           &payload,
+           sizeof(payload)
+       )
+   )
+   {
+       sdlog_ok = 0;
+   }
+}
 static uint8_t SDLOG_LogFlightEvent(
    FlightEvent_t event_id,
    uint32_t now_ms
@@ -1576,6 +1720,8 @@ static void SDLOG_Service(uint32_t now_ms)
        recovery ? RECOVERY_SD_GPS_INTERVAL_MS : SDLOG_GPS_INTERVAL_MS;
    uint32_t power_interval_ms =
        recovery ? RECOVERY_SD_POWER_INTERVAL_MS : SDLOG_POWER_INTERVAL_MS;
+   uint32_t kalman_interval_ms =
+       recovery ? RECOVERY_SD_KALMAN_INTERVAL_MS : SDLOG_KALMAN_INTERVAL_MS;
    uint32_t sync_interval_ms =
        recovery ? RECOVERY_SD_SYNC_INTERVAL_MS : SDLOG_SYNC_INTERVAL_MS;
    if (
@@ -1633,6 +1779,18 @@ static void SDLOG_Service(uint32_t now_ms)
    {
        sdlog_last_power_ms = now_ms;
        SDLOG_LogPower(now_ms);
+       if (!sdlog_ok)
+       {
+           return;
+       }
+   }
+   if (
+       (now_ms - sdlog_last_kalman_ms) >=
+       kalman_interval_ms
+   )
+   {
+       sdlog_last_kalman_ms = now_ms;
+       SDLOG_LogKalman(now_ms);
        if (!sdlog_ok)
        {
            return;
@@ -1771,6 +1929,7 @@ static void SDLOG_LogHighG(uint32_t now_ms);
 static void SDLOG_LogBaro(uint32_t now_ms);
 static void SDLOG_LogGPS(uint32_t now_ms);
 static void SDLOG_LogPower(uint32_t now_ms);
+static void SDLOG_LogKalman(uint32_t now_ms);
 static uint8_t SDLOG_LogFlightEvent(
    FlightEvent_t event_id,
    uint32_t now_ms
@@ -2164,6 +2323,13 @@ static uint8_t BLACKBOX_LogFlightEvent(
     *   reserved[46..49] = raw barometric vertical speed, ft/s x10
     *   reserved[50..51] = configured main deployment altitude, ft AGL
     *   reserved[52]     = main trigger reason
+    *   reserved[53..56] = shadow Kalman altitude, ft x10
+    *   reserved[57..60] = shadow Kalman vertical speed, ft/s x10
+    *   reserved[61..64] = shadow vertical acceleration, ft/s^2 x100
+    *   reserved[65..66] = learned pad 1 g magnitude, mg
+    *   reserved[67]     = Kalman pad-axis ready
+    *   reserved[68]     = Kalman acceleration mode
+    *   reserved[69]     = Kalman acceleration source
     */
    record.reserved[0] =
        flight_pyro_arm_would_be_high;
@@ -2215,6 +2381,39 @@ static uint8_t BLACKBOX_LogFlightEvent(
    );
    record.reserved[52] =
        (uint8_t)flight_main_trigger;
+   int32_t kalman_alt_ft10 =
+       Kalman_ScaleFloat(kalman_altitude_ft, 10.0f);
+   int32_t kalman_vel_ft10s =
+       Kalman_ScaleFloat(kalman_velocity_ft_s, 10.0f);
+   int32_t kalman_accel_ft100s2 =
+       Kalman_ScaleFloat(kalman_last_accel_ft_s2, 100.0f);
+   uint16_t kalman_one_g_u16 =
+       kalman_one_g_mg > 65535.0f ?
+       65535U :
+       (uint16_t)(kalman_one_g_mg + 0.5f);
+   memcpy(
+       &record.reserved[53],
+       &kalman_alt_ft10,
+       sizeof(kalman_alt_ft10)
+   );
+   memcpy(
+       &record.reserved[57],
+       &kalman_vel_ft10s,
+       sizeof(kalman_vel_ft10s)
+   );
+   memcpy(
+       &record.reserved[61],
+       &kalman_accel_ft100s2,
+       sizeof(kalman_accel_ft100s2)
+   );
+   memcpy(
+       &record.reserved[65],
+       &kalman_one_g_u16,
+       sizeof(kalman_one_g_u16)
+   );
+   record.reserved[67] = kalman_axis_ready;
+   record.reserved[68] = (uint8_t)kalman_last_accel_mode;
+   record.reserved[69] = kalman_last_accel_source;
    record.baro_alt_ft10 = baro_filtered_alt_ft10;
    record.vertical_speed_ft10s = baro_descent_ft10s;
    record.accel_mag_mg = flight_accel_mag_mg;
@@ -2323,6 +2522,308 @@ static uint32_t FlightLogic_VectorMagnitude(
        return 0xFFFFFFFFUL;
    }
    return (uint32_t)(magnitude + 0.5f);
+}
+static int32_t Kalman_ScaleFloat(float value, float scale)
+{
+   float scaled = value * scale;
+   if (scaled >= 0.0f)
+   {
+       return (int32_t)(scaled + 0.5f);
+   }
+   return (int32_t)(scaled - 0.5f);
+}
+static void Kalman_Init(
+   uint32_t now_ms,
+   float initial_altitude_ft
+)
+{
+   kalman_altitude_ft = initial_altitude_ft;
+   kalman_velocity_ft_s = 0.0f;
+   /* Start uncertain enough to follow the first real barometer samples. */
+   kalman_p00 = 25.0f;   /* 5 ft altitude sigma squared. */
+   kalman_p01 = 0.0f;
+   kalman_p10 = 0.0f;
+   kalman_p11 = 400.0f;  /* 20 ft/s velocity sigma squared. */
+   kalman_one_g_mg = 1000.0f;
+   kalman_axis_avg_x_mg = 0.0f;
+   kalman_axis_avg_y_mg = 0.0f;
+   kalman_axis_avg_z_mg = 0.0f;
+   kalman_axis_unit_x = 0.0f;
+   kalman_axis_unit_y = 0.0f;
+   kalman_axis_unit_z = 1.0f;
+   kalman_axis_ready = 0;
+   kalman_last_accel_ft_s2 = 0.0f;
+   kalman_last_accel_mag_mg = 0;
+   kalman_last_accel_source = 0;
+   kalman_last_accel_mode = KALMAN_ACCEL_MODE_NONE;
+   kalman_last_baro_update_used = 0;
+   kalman_last_ms = now_ms;
+   kalman_last_baro_sequence = baro_measurement_sequence;
+   kalman_initialized = 1;
+}
+static void Kalman_PredictStep(
+   float dt_s,
+   float accel_ft_s2,
+   float accel_sigma_ft_s2
+)
+{
+   if (dt_s <= 0.0f)
+   {
+       return;
+   }
+   /* State prediction with measured vertical acceleration as the input. */
+   kalman_altitude_ft +=
+       kalman_velocity_ft_s * dt_s +
+       0.5f * accel_ft_s2 * dt_s * dt_s;
+   kalman_velocity_ft_s +=
+       accel_ft_s2 * dt_s;
+
+   /*
+    * F = [1 dt; 0 1]
+    * Q = sigma_a^2 * [dt^4/4 dt^3/2; dt^3/2 dt^2]
+    */
+   float dt2 = dt_s * dt_s;
+   float dt3 = dt2 * dt_s;
+   float dt4 = dt2 * dt2;
+   float sigma2 = accel_sigma_ft_s2 * accel_sigma_ft_s2;
+   float q00 = 0.25f * dt4 * sigma2;
+   float q01 = 0.5f * dt3 * sigma2;
+   float q11 = dt2 * sigma2;
+
+   float p00 = kalman_p00;
+   float p01 = kalman_p01;
+   float p10 = kalman_p10;
+   float p11 = kalman_p11;
+
+   kalman_p00 =
+       p00 + dt_s * (p01 + p10) + dt2 * p11 + q00;
+   kalman_p01 =
+       p01 + dt_s * p11 + q01;
+   kalman_p10 =
+       p10 + dt_s * p11 + q01;
+   kalman_p11 =
+       p11 + q11;
+}
+static void Kalman_UpdateBaro(
+   float measured_altitude_ft
+)
+{
+   float r = KALMAN_BARO_SIGMA_FT * KALMAN_BARO_SIGMA_FT;
+   float innovation = measured_altitude_ft - kalman_altitude_ft;
+   float s = kalman_p00 + r;
+   if (s <= 0.0001f)
+   {
+       return;
+   }
+   float k0 = kalman_p00 / s;
+   float k1 = kalman_p10 / s;
+
+   kalman_altitude_ft += k0 * innovation;
+   kalman_velocity_ft_s += k1 * innovation;
+
+   /* Joseph covariance update for H = [1 0]. */
+   float p00 = kalman_p00;
+   float p01 = kalman_p01;
+   float p10 = kalman_p10;
+   float p11 = kalman_p11;
+   float a = 1.0f - k0;
+
+   float new_p00 =
+       a * a * p00 + k0 * k0 * r;
+   float new_p01 =
+       a * (p01 - k1 * p00) + k0 * k1 * r;
+   float new_p10 =
+       a * (p10 - k1 * p00) + k0 * k1 * r;
+   float new_p11 =
+       p11 - k1 * p01 - k1 * p10 + k1 * k1 * p00 +
+       k1 * k1 * r;
+
+   /* Keep the covariance explicitly symmetric after float roundoff. */
+   float cross = 0.5f * (new_p01 + new_p10);
+   kalman_p00 = new_p00;
+   kalman_p01 = cross;
+   kalman_p10 = cross;
+   kalman_p11 = new_p11;
+}
+static float Kalman_ComputeVerticalAcceleration(
+   int32_t accel_x_mg,
+   int32_t accel_y_mg,
+   int32_t accel_z_mg,
+   uint8_t accel_valid,
+   KalmanAccelMode_t *mode
+)
+{
+   *mode = KALMAN_ACCEL_MODE_NONE;
+   if (
+       !accel_valid ||
+       !kalman_axis_ready ||
+       kalman_one_g_mg < 100.0f
+   )
+   {
+       return 0.0f;
+   }
+   if (
+       flight_state != FLIGHT_STATE_ASCENT &&
+       flight_state != FLIGHT_STATE_COAST
+   )
+   {
+       return 0.0f;
+   }
+
+   /*
+    * Project the ADXL372 vector onto the pad world-up direction learned from
+    * the 1 g vector before launch. This preserves signed vertical specific
+    * force instead of using acceleration magnitude alone.
+    *
+    * This is still a 1D approximation. Without attitude tracking the initial
+    * world-up direction is treated as fixed in the sensor frame through
+    * ascent/coast.
+    */
+   float axis_specific_mg =
+       (float)accel_x_mg * kalman_axis_unit_x +
+       (float)accel_y_mg * kalman_axis_unit_y +
+       (float)accel_z_mg * kalman_axis_unit_z;
+   float axis_specific_g =
+       axis_specific_mg / kalman_one_g_mg;
+
+   *mode =
+       flight_state == FLIGHT_STATE_ASCENT ?
+       KALMAN_ACCEL_MODE_ASCENT :
+       KALMAN_ACCEL_MODE_COAST;
+
+   /* Accelerometers measure proper acceleration, so inertial a = f - g. */
+   return
+       (axis_specific_g - 1.0f) *
+       KALMAN_GRAVITY_FTPS2;
+}
+static void Kalman_Service(
+   uint32_t now_ms,
+   int32_t accel_x_mg,
+   int32_t accel_y_mg,
+   int32_t accel_z_mg,
+   uint32_t accel_mag_mg,
+   uint8_t accel_valid,
+   uint8_t accel_source
+)
+{
+   if (!kalman_initialized)
+   {
+       Kalman_Init(
+           now_ms,
+           (float)baro_alt_ft10 * 0.1f
+       );
+   }
+
+   kalman_last_baro_update_used = 0;
+   kalman_last_accel_mag_mg = accel_mag_mg;
+   kalman_last_accel_source = accel_valid ? accel_source : 0;
+
+   /*
+    * Learn the pad world-up direction from the ADXL372 1 g vector.
+    * Only learn while waiting on the pad and while the measured magnitude is
+    * physically close to 1 g.
+    */
+   if (
+       flight_state == FLIGHT_STATE_WAIT_FOR_LAUNCH &&
+       accel_valid &&
+       accel_mag_mg >= KALMAN_PAD_1G_MIN_MG &&
+       accel_mag_mg <= KALMAN_PAD_1G_MAX_MG
+   )
+   {
+       if (!kalman_axis_ready)
+       {
+           kalman_axis_avg_x_mg = (float)accel_x_mg;
+           kalman_axis_avg_y_mg = (float)accel_y_mg;
+           kalman_axis_avg_z_mg = (float)accel_z_mg;
+       }
+       else
+       {
+           kalman_axis_avg_x_mg =
+               kalman_axis_avg_x_mg * 0.995f +
+               (float)accel_x_mg * 0.005f;
+           kalman_axis_avg_y_mg =
+               kalman_axis_avg_y_mg * 0.995f +
+               (float)accel_y_mg * 0.005f;
+           kalman_axis_avg_z_mg =
+               kalman_axis_avg_z_mg * 0.995f +
+               (float)accel_z_mg * 0.005f;
+       }
+
+       float axis_mag_mg =
+           sqrtf(
+               kalman_axis_avg_x_mg * kalman_axis_avg_x_mg +
+               kalman_axis_avg_y_mg * kalman_axis_avg_y_mg +
+               kalman_axis_avg_z_mg * kalman_axis_avg_z_mg
+           );
+       if (axis_mag_mg >= (float)KALMAN_PAD_1G_MIN_MG)
+       {
+           kalman_axis_unit_x = kalman_axis_avg_x_mg / axis_mag_mg;
+           kalman_axis_unit_y = kalman_axis_avg_y_mg / axis_mag_mg;
+           kalman_axis_unit_z = kalman_axis_avg_z_mg / axis_mag_mg;
+           kalman_one_g_mg = axis_mag_mg;
+           kalman_axis_ready = 1;
+       }
+   }
+
+   uint32_t elapsed_ms = now_ms - kalman_last_ms;
+   if (elapsed_ms > 0U)
+   {
+       float remaining_s = (float)elapsed_ms * 0.001f;
+       KalmanAccelMode_t accel_mode = KALMAN_ACCEL_MODE_NONE;
+       float accel_ft_s2 =
+           Kalman_ComputeVerticalAcceleration(
+               accel_x_mg,
+               accel_y_mg,
+               accel_z_mg,
+               accel_valid,
+               &accel_mode
+           );
+       kalman_last_accel_mode = accel_mode;
+       kalman_last_accel_ft_s2 = accel_ft_s2;
+
+       float accel_sigma =
+           accel_mode == KALMAN_ACCEL_MODE_NONE ?
+           KALMAN_MODEL_PROCESS_SIGMA_FTPS2 :
+           KALMAN_ACCEL_PROCESS_SIGMA_FTPS2;
+
+       /* Split long superloop delays into stable prediction steps. */
+       while (remaining_s > 0.0f)
+       {
+           float step_s = remaining_s;
+           if (step_s > KALMAN_MAX_PREDICT_STEP_S)
+           {
+               step_s = KALMAN_MAX_PREDICT_STEP_S;
+           }
+           Kalman_PredictStep(
+               step_s,
+               accel_ft_s2,
+               accel_sigma
+           );
+           remaining_s -= step_s;
+       }
+       kalman_last_ms = now_ms;
+   }
+
+   /*
+    * Use every new raw barometer altitude sample on the pad and after the
+    * existing high-speed barometer lockout has declared the sensor trusted.
+    * Raw altitude is intentional. Feeding baro_filtered_alt_ft10 here would
+    * stack the old 70/30 low-pass filter in front of the Kalman measurement.
+    */
+   if (baro_measurement_sequence != kalman_last_baro_sequence)
+   {
+       kalman_last_baro_sequence = baro_measurement_sequence;
+       if (
+           baro_ok &&
+           (!flight_launch_detected || flight_baro_trusted)
+       )
+       {
+           Kalman_UpdateBaro(
+               (float)baro_alt_ft10 * 0.1f
+           );
+           kalman_last_baro_update_used = 1;
+       }
+   }
 }
 static const char *FlightLogic_StateName(
    FlightState_t state
@@ -2634,6 +3135,10 @@ static void FlightLogic_Init(
        baro_filtered_alt_ft10;
    flight_landing_reference_alt_ft10 =
        baro_filtered_alt_ft10;
+   Kalman_Init(
+       now_ms,
+       (float)baro_alt_ft10 * 0.1f
+   );
    FlightLogic_LogEvent(
        FLIGHT_EVENT_INIT_COMPLETE,
        now_ms
@@ -2837,6 +3342,22 @@ static void FlightLogic_Service(
                flight_accel_mag_mg
            ) / 4UL;
    }
+
+   /*
+    * Kalman uses the ADXL372 vector because it remains in range during boost.
+    * The low-G LSM6 accelerometers remain available to the existing flight
+    * logic but are not fed into the Kalman predictor near their +/-2 g limit.
+    */
+   Kalman_Service(
+       now_ms,
+       highg_x,
+       highg_y,
+       highg_z,
+       highg_accel_mag_mg,
+       highg_motion_ok,
+       highg_motion_ok ? 1U : 0U
+   );
+
    switch (flight_state)
    {
        case FLIGHT_STATE_WAIT_FOR_LAUNCH:
@@ -6021,6 +6542,7 @@ static void Baro_Service(uint32_t now_ms)
        return;
    }
    baro_alt_ft10 = AltitudeFtX10(baro_pressure_pa, baro_base_pa);
+   baro_measurement_sequence++;
    if (!baro_filter_ready)
    {
        baro_filtered_alt_ft10 = baro_alt_ft10;
@@ -6634,5 +7156,3 @@ void Error_Handler(void)
        HAL_Delay(100);
    }
 }
-
-
