@@ -1,6 +1,8 @@
 #include "main.h"
 #include "usb_device.h"
 #include "usbd_cdc_if.h"
+#include "usbd_cdc.h"
+extern USBD_HandleTypeDef hUsbDeviceFS;
 #include "fatfs.h"
 #include "ff.h"
 #include <string.h>
@@ -247,7 +249,10 @@ UART_HandleTypeDef huart1;
 #define SDLOG_SYNC_INTERVAL_MS       5000UL
 #define SDLOG_BUFFER_SIZE            8192U
 #define SDLOG_WRITE_CHUNK_SIZE        512U
-#define SDLOG_PREALLOCATED_SIZE   (8UL * 1024UL * 1024UL)
+/* About 80 minutes at 219 routine records/s, plus occasional event records. */
+#define SDLOG_PREALLOCATED_SIZE   (64UL * 1024UL * 1024UL)
+_Static_assert(SDLOG_PREALLOCATED_SIZE % SDLOG_WRITE_CHUNK_SIZE == 0U,
+               "SD log capacity must contain complete sectors");
 #define CONT_ADC_SAMPLES             8UL
 static uint32_t current_lora_frequency_hz = LORA_DEFAULT_FREQUENCY_HZ;
 static uint32_t actual_lora_frequency_hz = LORA_DEFAULT_FREQUENCY_HZ;
@@ -462,6 +467,13 @@ typedef struct
    uint32_t last_fix_ms;
 } GPS_Data_t;
 static GPS_Data_t gps = {0};
+/* Display-only GPS snapshot. Never used by flight logic or existing logs. */
+static uint8_t display_gps_seen = 0, display_gps_fix = 0;
+static uint32_t display_gps_itow = 0, display_gps_ms = 0;
+static uint32_t display_gps_speed = 0, display_gps_sacc = UINT32_MAX;
+static uint32_t display_gps_vacc = UINT32_MAX;
+static int32_t display_gps_alt = 0;
+
 typedef struct
 {
    uint8_t state;
@@ -766,6 +778,7 @@ static uint32_t blackbox_record_sequence = 0;
 static uint32_t blackbox_session_start_address = BLACKBOX_START_ADDR;
 static uint8_t sdlog_ok = 0;
 static uint8_t sdlog_ever_started = 0;
+static uint8_t sdlog_capacity_reached = 0;
 static FIL sdlog_file;
 static uint32_t sdlog_number = 0;
 static uint32_t sdlog_record_sequence = 0;
@@ -889,6 +902,54 @@ static uint16_t BLACKBOX_CRC16(
    const uint8_t *data,
    uint16_t length
 );
+/* Diagnostics are produced only from the main context, never an ISR.
+ * Keep the active USB buffer stable until the CDC driver completes TX.
+ */
+#define USB_DEBUG_QUEUE_COUNT 16U
+#define USB_DEBUG_LINE_SIZE 320U
+static uint8_t usb_debug_queue[USB_DEBUG_QUEUE_COUNT][USB_DEBUG_LINE_SIZE];
+static uint16_t usb_debug_length[USB_DEBUG_QUEUE_COUNT];
+static uint8_t usb_debug_head = 0, usb_debug_tail = 0, usb_debug_count = 0;
+static uint8_t usb_debug_active[USB_DEBUG_LINE_SIZE];
+static uint32_t usb_debug_dropped = 0;
+static uint32_t sd_debug_written = 0, sd_debug_max_write_ms = 0;
+static uint32_t sd_debug_write_failures = 0;
+static uint32_t sd_debug_last_result = 0, sd_debug_last_stage = 0;
+
+static void USB_DebugService(void)
+{
+    if (usb_debug_count == 0U) return;
+    /* Prevent USB disconnect/reset from changing the class pointer mid-call. */
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    USBD_CDC_HandleTypeDef *cdc =
+        (USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
+    if (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED &&
+        cdc != NULL && cdc->TxState == 0U) {
+        uint16_t length = usb_debug_length[usb_debug_tail];
+        memcpy(usb_debug_active, usb_debug_queue[usb_debug_tail], length);
+        if (CDC_Transmit_FS(usb_debug_active, length) == USBD_OK) {
+            usb_debug_tail = (uint8_t)((usb_debug_tail + 1U) % USB_DEBUG_QUEUE_COUNT);
+            usb_debug_count--;
+        }
+    }
+    __set_PRIMASK(primask);
+}
+static void USB_DebugEnqueue(const uint8_t *data, uint16_t length)
+{
+    if (!data || length == 0U) return;
+    USB_DebugService();
+    if (usb_debug_count == USB_DEBUG_QUEUE_COUNT) {
+        usb_debug_dropped++;
+        return;
+    }
+    if (length > USB_DEBUG_LINE_SIZE) length = USB_DEBUG_LINE_SIZE;
+    memcpy(usb_debug_queue[usb_debug_head], data, length);
+    usb_debug_length[usb_debug_head] = length;
+    usb_debug_head = (uint8_t)((usb_debug_head + 1U) % USB_DEBUG_QUEUE_COUNT);
+    usb_debug_count++;
+    USB_DebugService();
+}
 static void SDLOG_Debug(const char *format, ...)
 {
    char line[320];
@@ -910,15 +971,25 @@ static void SDLOG_Debug(const char *format, ...)
    {
        length = (int)sizeof(line) - 1;
    }
-   /*
-    * USB CDC is deliberately nonblocking.  If the host is disconnected or
-    * the previous diagnostic is still being sent, drop this message instead
-    * of delaying sensor service or flight-event detection.
-    */
-   (void)CDC_Transmit_FS(
-       (uint8_t *)line,
-       (uint16_t)length
-   );
+   USB_DebugEnqueue((const uint8_t *)line, (uint16_t)length);
+}
+static void USB_DebugStatus(void)
+{
+    static uint32_t last_ms = 0;
+    uint32_t now = HAL_GetTick();
+    if (now - last_ms < 5000UL) return;
+    last_ms = now;
+    SDLOG_Debug(
+        "\r\nSDLOG,STATUS=%s,TIME_MS=%lu,FILE=FLT%04lu.BIN,RECORDS=%lu,"
+        "WRITTEN=%lu,BUFFER=%u,DROPPED=%lu,MAXWRITE_MS=%lu,WRITEFAILS=%lu,"
+        "LASTFR=%lu,LASTSTAGE=%lu,RESET=%08lX,USB_DROPPED=%lu\r\n",
+        sdlog_capacity_reached ? "FULL" : (sdlog_ok ? "ACTIVE" : "INACTIVE"), (unsigned long)now,
+        (unsigned long)sdlog_number, (unsigned long)sdlog_record_sequence,
+        (unsigned long)sd_debug_written, (unsigned int)sdlog_buffer_used,
+        (unsigned long)sdlog_dropped_records, (unsigned long)sd_debug_max_write_ms,
+        (unsigned long)sd_debug_write_failures, (unsigned long)sd_debug_last_result,
+        (unsigned long)sd_debug_last_stage, (unsigned long)atlas_reset_flags,
+        (unsigned long)usb_debug_dropped);
 }
 static uint8_t SDLOG_FindNextFile(
    uint32_t *next_number,
@@ -1158,42 +1229,41 @@ static uint8_t SDLOG_Start(void)
     */
    uint8_t allocation_marker = 0U;
    UINT allocation_bytes_written = 0U;
-   result =
-       f_lseek(
-           &sdlog_file,
-           SDLOG_PREALLOCATED_SIZE - 1UL
-       );
-   if (result == FR_OK)
+   result = f_lseek(&sdlog_file, SDLOG_PREALLOCATED_SIZE - 1UL);
+   /* FatFs may return FR_OK with a clipped seek when the card is full. */
+   uint8_t allocation_ok = result == FR_OK &&
+       f_tell(&sdlog_file) == SDLOG_PREALLOCATED_SIZE - 1UL;
+   if (allocation_ok)
    {
-       result =
-           f_write(
-               &sdlog_file,
-               &allocation_marker,
-               1U,
-               &allocation_bytes_written
-           );
+       result = f_write(&sdlog_file, &allocation_marker, 1U,
+                        &allocation_bytes_written);
+       allocation_ok = result == FR_OK && allocation_bytes_written == 1U &&
+           f_tell(&sdlog_file) == SDLOG_PREALLOCATED_SIZE &&
+           f_size(&sdlog_file) == SDLOG_PREALLOCATED_SIZE;
    }
-   if (
-       result == FR_OK &&
-       allocation_bytes_written == 1U
-   )
+   if (allocation_ok)
    {
        result = f_sync(&sdlog_file);
+       allocation_ok = result == FR_OK;
    }
-   if (result == FR_OK)
+   if (allocation_ok)
    {
        result = f_lseek(&sdlog_file, 0U);
+       allocation_ok = result == FR_OK && f_tell(&sdlog_file) == 0U;
    }
-   if (result != FR_OK || allocation_bytes_written != 1U)
+   if (!allocation_ok)
    {
        SDLOG_Debug(
-           "\r\nSDLOG,PREALLOCATE=FAIL,FILE=%s,FRESULT=%u\r\n",
-           filename,
-           (unsigned int)result
-       );
+           "\r\nSDLOG,PREALLOCATE=FAIL,FILE=%s,FRESULT=%u,"
+           "WANTED=%lu,SIZE=%lu,POSITION=%lu\r\n",
+           filename, (unsigned int)result,
+           (unsigned long)SDLOG_PREALLOCATED_SIZE,
+           (unsigned long)f_size(&sdlog_file),
+           (unsigned long)f_tell(&sdlog_file));
        f_close(&sdlog_file);
        return 0;
    }
+   sdlog_capacity_reached = 0;
    sdlog_record_sequence = 0;
    sdlog_buffer_used = 0;
    sdlog_dropped_records = 0;
@@ -1216,9 +1286,10 @@ static uint8_t SDLOG_Start(void)
        return 0;
    }
    SDLOG_Debug(
-       "\r\nSDLOG,START=OK,FILE=%s,LOG=%lu\r\n",
+       "\r\nSDLOG,START=OK,FILE=%s,LOG=%lu,CAPACITY=%lu\r\n",
        filename,
-       (unsigned long)sdlog_number
+       (unsigned long)sdlog_number,
+       (unsigned long)SDLOG_PREALLOCATED_SIZE
    );
    sdlog_ever_started = 1;
    return 1;
@@ -1233,6 +1304,24 @@ static uint8_t SDLOG_FlushBuffer(void)
    if (sdlog_buffer_used < SDLOG_WRITE_CHUNK_SIZE)
    {
        return 1;
+   }
+   /* Never grow the file beyond the size synchronized at startup.
+    * Stop this SD session at its boundary. No erase, wrap or file creation
+    * occurs here, and the flight state machine continues independently.
+    */
+   if (f_tell(&sdlog_file) > SDLOG_PREALLOCATED_SIZE - SDLOG_WRITE_CHUNK_SIZE)
+   {
+       if (!sdlog_capacity_reached)
+       {
+           sdlog_capacity_reached = 1;
+           SDLOG_Debug(
+               "\r\nSDLOG,STOP=FULL,POSITION=%lu,CAPACITY=%lu,BUFFER=%u\r\n",
+               (unsigned long)f_tell(&sdlog_file),
+               (unsigned long)SDLOG_PREALLOCATED_SIZE,
+               (unsigned int)sdlog_buffer_used);
+       }
+       sdlog_ok = 0;
+       return 0;
    }
    /* A busy card is normal. Leave the sector in RAM and retry later. */
    if (!USER_IsCardReadyNonBlocking())
@@ -1252,11 +1341,16 @@ static uint8_t SDLOG_FlushBuffer(void)
        );
    USER_EndRuntimeTransaction();
    uint32_t write_elapsed_ms = HAL_GetTick() - write_start_ms;
+   if (write_elapsed_ms > sd_debug_max_write_ms)
+       sd_debug_max_write_ms = write_elapsed_ms;
    if (
        result != FR_OK ||
        bytes_written != bytes_to_write
    )
    {
+       sd_debug_write_failures++;
+       sd_debug_last_result = (uint32_t)result;
+       sd_debug_last_stage = USER_GetLastErrorStage();
        SDLOG_Debug(
            "\r\nSDLOG,WRITE=FAIL,FRESULT=%u,WANTED=%u,WROTE=%u,"
            "SDSTAGE=%u,ELAPSEDMS=%lu\r\n",
@@ -1268,6 +1362,7 @@ static uint8_t SDLOG_FlushBuffer(void)
        );
        return 0;
    }
+   sd_debug_written += bytes_written;
    sdlog_buffer_used -= (uint16_t)bytes_written;
    if (sdlog_buffer_used > 0U)
    {
@@ -2478,6 +2573,169 @@ static uint8_t BLACKBOX_LogFlightEvent(
    blackbox_record_sequence++;
    return 1;
 }
+/* Ground-test state is RAM-only and is never restored after reset. */
+typedef enum { GT_IDLE, GT_ARMED, GT_COUNTDOWN, GT_FIRING, GT_DONE, GT_CANCELLED } GroundTestState;
+static GroundTestState gt_state = GT_IDLE;
+static uint32_t gt_id = 0, gt_started_ms = 0, gt_armed_ms = 0, gt_ping_ms = 0;
+static uint32_t gt_cooldown_ms = 0;
+static uint8_t gt_channel = 0, gt_cooldown = 0;
+static uint8_t GroundTest_Active(void)
+{
+    return gt_state == GT_ARMED || gt_state == GT_COUNTDOWN || gt_state == GT_FIRING;
+}
+static void GroundTest_Stop(GroundTestState result, uint32_t now)
+{
+    FlightOutputs_Safe(); /* FIRE LOW before ARM LOW. */
+    gt_state = result;
+    gt_cooldown = 1;
+    gt_cooldown_ms = now;
+}
+static void GroundTest_Service(uint32_t now)
+{
+    if (gt_cooldown && now - gt_cooldown_ms >= 2000UL) gt_cooldown = 0;
+    if (!GroundTest_Active()) return;
+    if (flight_launch_detected || flight_state != FLIGHT_STATE_WAIT_FOR_LAUNCH ||
+        now - gt_ping_ms >= 3000UL ||
+        (gt_state == GT_ARMED && now - gt_armed_ms >= 15000UL))
+    {
+        GroundTest_Stop(GT_CANCELLED, now);
+        return;
+    }
+    HAL_GPIO_WritePin(AUX_FIRE_PORT, AUX_FIRE_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(PYRO_ARM_PORT, PYRO_ARM_PIN, GPIO_PIN_SET);
+    if (gt_state == GT_COUNTDOWN && now - gt_started_ms >= 5000UL)
+    {
+        /* Only the selected output rises. Timing begins at the output write. */
+        HAL_GPIO_WritePin(gt_channel == 1 ? MAIN_FIRE_PORT : APO_FIRE_PORT,
+                         gt_channel == 1 ? MAIN_FIRE_PIN : APO_FIRE_PIN, GPIO_PIN_SET);
+        gt_started_ms = HAL_GetTick();
+        gt_state = GT_FIRING;
+        return; /* now predates the output write; avoid unsigned underflow. */
+    }
+    if (gt_state == GT_FIRING && now - gt_started_ms >= FLIGHT_FIRE_INDICATOR_PULSE_MS)
+        GroundTest_Stop(GT_DONE, now);
+}
+static const char *GroundTest_StateName(void)
+{
+    switch (gt_state) {
+    case GT_ARMED: return "ARMED";
+    case GT_COUNTDOWN: return "COUNTDOWN";
+    case GT_FIRING: return "FIRING";
+    case GT_DONE: return "DONE";
+    case GT_CANCELLED: return "CANCELLED";
+    default: return "IDLE";
+    }
+}
+static void GroundTest_Report(void)
+{
+    char message[160];
+    uint32_t now = HAL_GetTick();
+    GroundTest_Service(now);
+    uint32_t left = gt_state == GT_COUNTDOWN ? 5000UL - (now - gt_started_ms) : 0;
+    snprintf(message, sizeof(message),
+        "GTEST,STATE=%s,CH=%s,ID=%lu,LEFT=%lu,APOC=%u,MAINC=%u,FS=%u",
+        GroundTest_StateName(), gt_channel == 1 ? "MAIN" : gt_channel == 2 ? "APO" : "NONE",
+        (unsigned long)gt_id, (unsigned long)left,
+        (unsigned int)continuity_apo_state, (unsigned int)continuity_main_state,
+        (unsigned int)flight_state);
+    LORA_Send((uint8_t *)message, (uint8_t)strlen(message), 1000);
+    LORA_RxContinuous();
+}
+static uint8_t GroundTest_ParseId(const char *text, uint32_t *value)
+{
+    /* Strict decimal parsing with overflow rejection. */
+    if (!text || !*text) return 0;
+    uint32_t n = 0;
+    for (; *text; text++) {
+        if (*text < '0' || *text > '9') return 0;
+        uint32_t digit = (uint32_t)(*text - '0');
+        if (n > (UINT32_MAX - digit) / 10U) return 0;
+        n = n * 10U + digit;
+    }
+    *value = n;
+    return 1;
+}
+static uint8_t GroundTest_Command(const char *command)
+{
+    if (strncmp(command, "CMD,GT,", 7) != 0) return 0;
+    uint32_t now = HAL_GetTick(), id = 0;
+    GroundTest_Service(now);
+    const char *action = command + 7;
+    uint8_t channel = 0;
+    const char *id_text = NULL;
+    if (strncmp(action, "ARM,MAIN,", 9) == 0) { channel = 1; id_text = action + 9; }
+    else if (strncmp(action, "ARM,APO,", 8) == 0) { channel = 2; id_text = action + 8; }
+    if (id_text) {
+        if (GroundTest_ParseId(id_text, &id) && id != 0 && id == gt_id + 1UL &&
+            !GroundTest_Active() && !flight_launch_detected &&
+            flight_state == FLIGHT_STATE_WAIT_FOR_LAUNCH) {
+            FlightOutputs_Safe();
+            gt_id = id; gt_channel = channel;
+            gt_armed_ms = now; gt_ping_ms = now; gt_state = GT_ARMED;
+            HAL_GPIO_WritePin(PYRO_ARM_PORT, PYRO_ARM_PIN, GPIO_PIN_SET);
+        }
+    } else if (strncmp(action, "GO,", 3) == 0) {
+        if (GroundTest_ParseId(action + 3, &id) && id == gt_id && gt_state == GT_ARMED) {
+            gt_state = GT_COUNTDOWN; gt_started_ms = now; gt_ping_ms = now;
+        }
+    } else if (strncmp(action, "CANCEL,", 7) == 0) {
+        if (GroundTest_ParseId(action + 7, &id) && id == gt_id && GroundTest_Active())
+            GroundTest_Stop(GT_CANCELLED, now);
+    } else if (strncmp(action, "POLL,", 5) == 0) {
+        if (GroundTest_ParseId(action + 5, &id) && id == gt_id && GroundTest_Active())
+            gt_ping_ms = now;
+    }
+    GroundTest_Report();
+    return 1;
+}
+static uint8_t continuity_tx_pending = 0;
+static uint32_t continuity_tx_queued_ms = 0;
+/* Display quality checks only. The original flight inputs remain unchanged. */
+static uint8_t GPS_SpeedReason(uint32_t now)
+{
+    if (!gps.present) return 1;                       /* NO_GPS */
+    if (!display_gps_seen || now - display_gps_ms > 1500UL) return 3; /* STALE */
+    if (!display_gps_fix) return 5;   /* NO_3D_FIX */
+    if (display_gps_sacc > 5000UL) return 7;             /* SPEED_ACCURACY */
+    if (display_gps_speed > 500000UL) return 8;       /* SPEED_RANGE */
+    return 0;
+}
+static const char *GPS_SpeedReasonName(uint8_t reason)
+{
+    static const char *names[] = {"OK", "NO_GPS", "CONFIG", "STALE", "BACKLOG",
+        "NO_3D_FIX", "ACQUIRING", "SPEED_ACCURACY", "SPEED_RANGE"};
+    return reason < sizeof(names) / sizeof(names[0]) ? names[reason] : "UNKNOWN";
+}
+static uint16_t GPS_MachX1000(uint32_t now)
+{
+    /* UINT16_MAX means unavailable. Ground-relative speed, no wind correction.
+     * ISA temperature uses GPS MSL altitude, not electronics temperature.
+     * This model covers -1 to 20 km MSL, including the isothermal tropopause.
+     */
+    if (GPS_SpeedReason(now) != 0 || display_gps_vacc > 100000UL ||
+        display_gps_alt < -1000000L || display_gps_alt > 20000000L) return UINT16_MAX;
+    float h_m = (float)display_gps_alt / 1000.0f;
+    float temp_k = h_m < 11000.0f ? 288.15f - 0.0065f * h_m : 216.65f;
+    float sound_mps = sqrtf(1.4f * 287.05f * temp_k);
+    return (uint16_t)((float)display_gps_speed / sound_mps + 0.5f);
+}
+static void Continuity_SendTelemetry(void)
+{
+    char message[240], mach[16] = "---";
+    uint32_t now = HAL_GetTick();
+    uint8_t reason = GPS_SpeedReason(now);
+    uint16_t mach_x1000 = GPS_MachX1000(now);
+    if (mach_x1000 != UINT16_MAX) FormatSigned3(mach, sizeof(mach), mach_x1000);
+    snprintf(message, sizeof(message),
+        "ATSTAT,APOC=%u,MAINC=%u,MACH=%s,SPDMMPS=%lu,SACCMMPS=%lu,GPSQ=%s,VAGE=%lu",
+        (unsigned int)continuity_apo_state, (unsigned int)continuity_main_state,
+        mach, (unsigned long)display_gps_speed, (unsigned long)display_gps_sacc,
+        GPS_SpeedReasonName(reason),
+        (unsigned long)(display_gps_seen ? now - display_gps_ms : UINT32_MAX));
+    LORA_Send((uint8_t *)message, (uint8_t)strlen(message), 1000);
+    if (FlightLogic_IsRecovery()) LORA_Sleep(); else LORA_RxContinuous();
+}
+
 static void FlightOutputs_Safe(void)
 {
    /* Match the proven bench-test shutdown order: FIRE LOW first. */
@@ -2514,6 +2772,9 @@ static void FlightOutputs_TriggerMain(uint32_t now_ms)
 }
 static void FlightOutputs_Service(uint32_t now_ms)
 {
+   GroundTest_Service(HAL_GetTick());
+   if (GroundTest_Active()) return;
+
    /* PB2 AUX is forced LOW for the entire power cycle. */
    HAL_GPIO_WritePin(AUX_FIRE_PORT, AUX_FIRE_PIN, GPIO_PIN_RESET);
    if (
@@ -2914,6 +3175,13 @@ static void FlightLogic_Service(
        return;
    }
    flight_last_logic_ms = now_ms;
+   /* Ignore test impulses and allow two seconds for the board to settle. */
+   if (flight_state == FLIGHT_STATE_WAIT_FOR_LAUNCH &&
+       (GroundTest_Active() || gt_cooldown))
+   {
+       flight_launch_candidate_ms = 0;
+       return;
+   }
    /*
     * Refresh IMU identity independently from the slow telemetry path.
     * Each motion read also checks the SPI transaction result, so a bus error
@@ -3954,6 +4222,22 @@ int main(void)
        {
            LORA_ServiceRx();
        }
+       /* During a ground test, prioritize radio, output deadlines and sensing. */
+       if (GroundTest_Active())
+       {
+           FlightOutputs_Service(HAL_GetTick());
+           if (gt_state != GT_FIRING) Continuity_Service(HAL_GetTick());
+           ATLAS_WatchdogKick();
+           continue;
+       }
+       /* Leave an RX window for the ground station's telemetry ACK. */
+       if (continuity_tx_pending && lora_ok &&
+           (HAL_GetTick() - continuity_tx_queued_ms) >= 500UL)
+       {
+           continuity_tx_pending = 0;
+           Continuity_SendTelemetry();
+           now_ms = HAL_GetTick();
+       }
        Baro_Service(now_ms);
        /*
         * Flight event/state detector.
@@ -4230,12 +4514,16 @@ int main(void)
                    );
                }
            }
-           if (baro_ok)
+           /* Existing GS fields now carry the logged Kalman estimates.
+            * Units remain feet and ft/s; positive velocity means ascent.
+            * Flight event decisions continue using their existing inputs.
+            */
+           if (baro_ok && kalman_ready)
            {
                FormatSigned1(baro_altitude, sizeof(baro_altitude),
-                             baro_filtered_alt_ft10);
+                             kalman_altitude_ft10);
                FormatSigned1(descent_rate, sizeof(descent_rate),
-                             baro_descent_ft10s);
+                             kalman_vertical_speed_ft10s);
            }
            if (imu1_ok)
            {
@@ -4301,7 +4589,14 @@ int main(void)
                    }
                }
            }
+           if (lora_ok)
+           {
+               continuity_tx_pending = 1;
+               continuity_tx_queued_ms = HAL_GetTick();
+           }
        }
+       USB_DebugStatus();
+       USB_DebugService();
        ATLAS_WatchdogKick();
    }
 }
@@ -5442,8 +5737,8 @@ static void BLACKBOX_DebugReadCurrentSession(void)
        {
            length = (int)sizeof(line) - 1;
        }
-       (void)CDC_Transmit_FS(
-           (uint8_t *)line,
+       USB_DebugEnqueue(
+           (const uint8_t *)line,
            (uint16_t)length
        );
    }
@@ -5585,8 +5880,8 @@ static void BLACKBOX_DebugReadCurrentSession(void)
            {
                length = (int)sizeof(line) - 1;
            }
-           (void)CDC_Transmit_FS(
-               (uint8_t *)line,
+           USB_DebugEnqueue(
+               (const uint8_t *)line,
                (uint16_t)length
            );
        }
@@ -5760,6 +6055,9 @@ static void LORA_ServiceRx(void)
        return;
    }
    buffer[len] = '\0';
+   if (GroundTest_Command((const char *)buffer)) return;
+   /* Keep slow maintenance operations out of an active ground test. */
+   if (GroundTest_Active()) return;
    /*
     * Lightweight health query is safe even after launch. It avoids making
     * the already-near-maximum AT1 telemetry packet longer.
@@ -5813,17 +6111,18 @@ static void LORA_ServiceRx(void)
     *
     * Altitude is AGL relative to the launch-pad barometric baseline.
     */
-   if (strncmp((char *)buffer, "CMD,MAINALTFT=", 14) == 0)
+   const size_t main_alt_prefix_len = sizeof("CMD,MAINALTFT=") - 1U;
+   if (strncmp((char *)buffer, "CMD,MAINALTFT=", main_alt_prefix_len) == 0)
    {
        char *end_ptr = NULL;
        unsigned long requested_main_alt_ft =
            strtoul(
-               (char *)buffer + 14,
+               (char *)buffer + main_alt_prefix_len,
                &end_ptr,
                10
            );
        if (
-           end_ptr != ((char *)buffer + 14) &&
+           end_ptr != ((char *)buffer + main_alt_prefix_len) &&
            *end_ptr == '\0' &&
            requested_main_alt_ft >=
                FLIGHT_MAIN_DEPLOY_MIN_ALT_FT &&
@@ -6904,6 +7203,31 @@ static int32_t ReadI4LE(const uint8_t *p)
        ((uint32_t)p[3] << 24);
    return (int32_t)value;
 }
+/* Display-only observer. Duplicate epochs never refresh display freshness.
+ * After a receiver restart, re-seed after a stale interval. No GPS commands,
+ * shared flight-state writes, extra sensor reads or log records are added.
+ */
+static void GPS_DisplayObserve(const uint8_t *p)
+{
+    uint32_t now = HAL_GetTick();
+    uint32_t itow = (uint32_t)ReadI4LE(p);
+    if (itow >= 604800000UL) return;
+    if (display_gps_seen) {
+        uint32_t delta = itow >= display_gps_itow ? itow - display_gps_itow :
+            604800000UL - display_gps_itow + itow;
+        if (delta == 0) return;
+        if (delta >= 302400000UL && now - display_gps_ms <= 2000UL) return;
+    }
+    display_gps_seen = 1;
+    display_gps_itow = itow;
+    display_gps_ms = now;
+    display_gps_fix = p[20] == 3U && (p[21] & 1U) && !(p[78] & 1U);
+    display_gps_speed = FlightLogic_VectorMagnitude(
+        ReadI4LE(p + 48), ReadI4LE(p + 52), ReadI4LE(p + 56));
+    display_gps_sacc = (uint32_t)ReadI4LE(p + 68);
+    display_gps_vacc = (uint32_t)ReadI4LE(p + 44);
+    display_gps_alt = ReadI4LE(p + 36);
+}
 static void GPS_HandleMessage(uint8_t msg_class, uint8_t msg_id,
                              const uint8_t *payload, uint16_t payload_len)
 {
@@ -6911,6 +7235,7 @@ static void GPS_HandleMessage(uint8_t msg_class, uint8_t msg_id,
    {
        return;
    }
+   GPS_DisplayObserve(payload);
    gps.present = 1;
    gps.last_message_ms = HAL_GetTick();
    gps.fix_type = payload[20];
@@ -7357,4 +7682,3 @@ void Error_Handler(void)
        HAL_Delay(100);
    }
 }
-
