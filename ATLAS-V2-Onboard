@@ -210,7 +210,8 @@ UART_HandleTypeDef huart1;
 * ATLAS V2 microSD high-rate flight recorder
 * ==========================================================================
 *
-* One power-up creates one new FLTxxxx.BIN file.
+* Each power-up starts a new FLTxxxx.BIN file. Full 64 MiB files roll over
+* to the next unused number. Record sequences and timestamps continue.
 * Existing files are never overwritten.
 *
 * File layout:
@@ -772,13 +773,17 @@ _Static_assert(sizeof(SDLogEventPayload_t) <= 46,
 _Static_assert(sizeof(SDLogFlightTracePayload_t) <= 46,
               "Flight trace payload too large");
 static uint8_t blackbox_ok = 0;
+static uint8_t flash_present = 0;
+/* 0 = no erase this boot, 1 = verified empty, 2 = erase/verify failed. */
+static uint8_t flash_erase_result = 0;
 static uint32_t blackbox_next_address = BLACKBOX_START_ADDR;
 static uint32_t blackbox_session_number = 0;
 static uint32_t blackbox_record_sequence = 0;
 static uint32_t blackbox_session_start_address = BLACKBOX_START_ADDR;
 static uint8_t sdlog_ok = 0;
 static uint8_t sdlog_ever_started = 0;
-static uint8_t sdlog_capacity_reached = 0;
+static uint32_t sdlog_rollover_count = 0;
+static uint32_t sdlog_max_rollover_ms = 0;
 static FIL sdlog_file;
 static uint32_t sdlog_number = 0;
 static uint32_t sdlog_record_sequence = 0;
@@ -982,14 +987,16 @@ static void USB_DebugStatus(void)
     SDLOG_Debug(
         "\r\nSDLOG,STATUS=%s,TIME_MS=%lu,FILE=FLT%04lu.BIN,RECORDS=%lu,"
         "WRITTEN=%lu,BUFFER=%u,DROPPED=%lu,MAXWRITE_MS=%lu,WRITEFAILS=%lu,"
-        "LASTFR=%lu,LASTSTAGE=%lu,RESET=%08lX,USB_DROPPED=%lu\r\n",
-        sdlog_capacity_reached ? "FULL" : (sdlog_ok ? "ACTIVE" : "INACTIVE"), (unsigned long)now,
+        "LASTFR=%lu,LASTSTAGE=%lu,RESET=%08lX,USB_DROPPED=%lu,"
+        "ROLLS=%lu,MAXROLL_MS=%lu\r\n",
+        sdlog_ok ? "ACTIVE" : "INACTIVE", (unsigned long)now,
         (unsigned long)sdlog_number, (unsigned long)sdlog_record_sequence,
         (unsigned long)sd_debug_written, (unsigned int)sdlog_buffer_used,
         (unsigned long)sdlog_dropped_records, (unsigned long)sd_debug_max_write_ms,
         (unsigned long)sd_debug_write_failures, (unsigned long)sd_debug_last_result,
         (unsigned long)sd_debug_last_stage, (unsigned long)atlas_reset_flags,
-        (unsigned long)usb_debug_dropped);
+        (unsigned long)usb_debug_dropped,
+        (unsigned long)sdlog_rollover_count, (unsigned long)sdlog_max_rollover_ms);
 }
 static uint8_t SDLOG_FindNextFile(
    uint32_t *next_number,
@@ -1166,52 +1173,46 @@ static uint8_t SDLOG_WriteHeader(void)
    }
    return 1;
 }
-static uint8_t SDLOG_Start(void)
+static uint8_t SDLOG_OpenNextFile(uint8_t continuation)
 {
    FRESULT result;
-   /*
-    * USER_Driver has already been linked by MX_FATFS_Init().
-    * Force a real mount now.
-    */
-   result =
-       f_mount(
-           &USERFatFS,
-           USERPath,
-           1
-       );
-   if (result != FR_OK)
-   {
-       SDLOG_Debug(
-           "\r\nSDLOG,MOUNT=FAIL,FRESULT=%u\r\n",
-           (unsigned int)result
-       );
-       return 0;
-   }
    char filename[16];
-   if (
-       !SDLOG_FindNextFile(
-           &sdlog_number,
-           filename,
-           sizeof(filename)
-       )
-   )
+   uint32_t next_number = sdlog_number;
+   if (!continuation)
    {
-       SDLOG_Debug(
-           "\r\nSDLOG,FILESCAN=FAIL\r\n"
-       );
-       return 0;
+       if (!SDLOG_FindNextFile(&next_number, filename, sizeof(filename)))
+       {
+           SDLOG_Debug("\r\nSDLOG,FILESCAN=FAIL\r\n");
+           return 0;
+       }
+   }
+   else
+   {
+       /* The mounted volume has one writer. Skip collisions without scanning
+        * the entire directory again. FA_CREATE_NEW never overwrites a file.
+        */
+       if (next_number >= 9999UL)
+       {
+           SDLOG_Debug("\r\nSDLOG,ROLLOVER=FAIL,REASON=FILE_NUMBERS_EXHAUSTED\r\n");
+           return 0;
+       }
+       next_number++;
+       snprintf(filename, sizeof(filename), "FLT%04lu.BIN",
+                (unsigned long)next_number);
    }
    /*
     * FA_CREATE_NEW is intentional:
     * even if our directory scan somehow races/fails, an existing flight log
     * can never be overwritten.
     */
-   result =
-       f_open(
-           &sdlog_file,
-           filename,
-           FA_CREATE_NEW | FA_WRITE
-       );
+   do
+   {
+       result = f_open(&sdlog_file, filename, FA_CREATE_NEW | FA_WRITE);
+       if (result != FR_EXIST || next_number >= 9999UL) break;
+       next_number++;
+       snprintf(filename, sizeof(filename), "FLT%04lu.BIN",
+                (unsigned long)next_number);
+   } while (1);
    if (result != FR_OK)
    {
        SDLOG_Debug(
@@ -1222,7 +1223,7 @@ static uint8_t SDLOG_Start(void)
        return 0;
    }
    /*
-    * Reserve the complete file before flight. Runtime sector writes then
+    * Reserve each complete file before its first record. Sector writes then
     * follow an existing FAT chain and never need to grow the file or update
     * its directory size. The file remains recoverable after sudden power
     * loss without periodic metadata synchronization.
@@ -1263,7 +1264,47 @@ static uint8_t SDLOG_Start(void)
        f_close(&sdlog_file);
        return 0;
    }
-   sdlog_capacity_reached = 0;
+   uint32_t previous_number = sdlog_number;
+   sdlog_number = next_number;
+   if (!SDLOG_WriteHeader())
+   {
+       SDLOG_Debug(
+           "\r\nSDLOG,HEADER=FAIL,FILE=%s\r\n",
+           filename
+       );
+       f_close(&sdlog_file);
+       sdlog_number = previous_number;
+       return 0;
+   }
+   SDLOG_Debug(
+       "\r\nSDLOG,START=OK,FILE=%s,LOG=%lu,CAPACITY=%lu\r\n",
+       filename,
+       (unsigned long)sdlog_number,
+       (unsigned long)SDLOG_PREALLOCATED_SIZE
+   );
+   return 1;
+}
+static uint8_t SDLOG_Start(void)
+{
+   FRESULT result;
+   /*
+    * USER_Driver has already been linked by MX_FATFS_Init().
+    * Force a real mount now.
+    */
+   result =
+       f_mount(
+           &USERFatFS,
+           USERPath,
+           1
+       );
+   if (result != FR_OK)
+   {
+       SDLOG_Debug(
+           "\r\nSDLOG,MOUNT=FAIL,FRESULT=%u\r\n",
+           (unsigned int)result
+       );
+       return 0;
+   }
    sdlog_record_sequence = 0;
    sdlog_buffer_used = 0;
    sdlog_dropped_records = 0;
@@ -1276,23 +1317,46 @@ static uint8_t SDLOG_Start(void)
    sdlog_last_baro_ms = now_ms;
    sdlog_last_gps_ms = now_ms;
    sdlog_last_power_ms = now_ms;
-   if (!SDLOG_WriteHeader())
-   {
-       SDLOG_Debug(
-           "\r\nSDLOG,HEADER=FAIL,FILE=%s\r\n",
-           filename
-       );
-       f_close(&sdlog_file);
-       return 0;
-   }
-   SDLOG_Debug(
-       "\r\nSDLOG,START=OK,FILE=%s,LOG=%lu,CAPACITY=%lu\r\n",
-       filename,
-       (unsigned long)sdlog_number,
-       (unsigned long)SDLOG_PREALLOCATED_SIZE
-   );
+   sdlog_rollover_count = 0;
+   sdlog_max_rollover_ms = 0;
+   if (!SDLOG_OpenNextFile(0U)) return 0;
    sdlog_ever_started = 1;
    return 1;
+}
+static uint8_t SDLOG_Rollover(void)
+{
+   uint32_t start_ms = HAL_GetTick();
+   uint32_t previous_number = sdlog_number;
+   /* Metadata operations use the driver's existing bounded sync budget.
+    * Do not remount, reset sampling clocks or discard queued records here.
+    * A failure is latched by the caller, rather than repeatedly allocating.
+    */
+   USER_BeginRuntimeSyncTransaction();
+   FRESULT result = f_close(&sdlog_file);
+   uint8_t opened = 0;
+   if (result == FR_OK) opened = SDLOG_OpenNextFile(1U);
+   USER_EndRuntimeTransaction();
+   uint32_t elapsed_ms = HAL_GetTick() - start_ms;
+   if (elapsed_ms > sdlog_max_rollover_ms)
+       sdlog_max_rollover_ms = elapsed_ms;
+   if (result != FR_OK || !opened)
+   {
+       sdlog_ok = 0;
+       SDLOG_Debug("\r\nSDLOG,ROLLOVER=FAIL,FROM=FLT%04lu.BIN,"
+                   "CLOSEFR=%u,ELAPSEDMS=%lu,BUFFER=%u\r\n",
+                   (unsigned long)previous_number, (unsigned int)result,
+                   (unsigned long)elapsed_ms, (unsigned int)sdlog_buffer_used);
+       return 0;
+   }
+   sdlog_rollover_count++;
+   SDLOG_Debug("\r\nSDLOG,ROLLOVER=OK,FROM=FLT%04lu.BIN,TO=FLT%04lu.BIN,"
+               "ELAPSEDMS=%lu,BUFFER=%u\r\n",
+               (unsigned long)previous_number, (unsigned long)sdlog_number,
+               (unsigned long)elapsed_ms, (unsigned int)sdlog_buffer_used);
+   /* Let the superloop run before the next data write. The header's sync
+    * might have left the card busy. The queued sector remains untouched.
+    */
+   return 2;
 }
 static uint8_t SDLOG_FlushBuffer(void)
 {
@@ -1305,28 +1369,17 @@ static uint8_t SDLOG_FlushBuffer(void)
    {
        return 1;
    }
-   /* Never grow the file beyond the size synchronized at startup.
-    * Stop this SD session at its boundary. No erase, wrap or file creation
-    * occurs here, and the flight state machine continues independently.
-    */
+   /* A busy card is normal. Retain the buffer and retry on a later call. */
+   if (!USER_IsCardReadyNonBlocking()) return 2;
+   if (f_tell(&sdlog_file) == SDLOG_PREALLOCATED_SIZE)
+       return SDLOG_Rollover();
+   /* Reject an unexpected position rather than writing outside the reserve. */
    if (f_tell(&sdlog_file) > SDLOG_PREALLOCATED_SIZE - SDLOG_WRITE_CHUNK_SIZE)
    {
-       if (!sdlog_capacity_reached)
-       {
-           sdlog_capacity_reached = 1;
-           SDLOG_Debug(
-               "\r\nSDLOG,STOP=FULL,POSITION=%lu,CAPACITY=%lu,BUFFER=%u\r\n",
-               (unsigned long)f_tell(&sdlog_file),
-               (unsigned long)SDLOG_PREALLOCATED_SIZE,
-               (unsigned int)sdlog_buffer_used);
-       }
+       SDLOG_Debug("\r\nSDLOG,STOP=BAD_POSITION,POSITION=%lu\r\n",
+                   (unsigned long)f_tell(&sdlog_file));
        sdlog_ok = 0;
        return 0;
-   }
-   /* A busy card is normal. Leave the sector in RAM and retry later. */
-   if (!USER_IsCardReadyNonBlocking())
-   {
-       return 2;
    }
    const UINT bytes_to_write = SDLOG_WRITE_CHUNK_SIZE;
    UINT bytes_written = 0;
@@ -4031,6 +4084,8 @@ int main(void)
        &flash_memory_type,
        &flash_capacity
    );
+   flash_present = flash_manufacturer == 0xEF &&
+       flash_memory_type == 0x40 && flash_capacity == 0x18;
    /* Check for W25Q128: EF 40 18 */
    if (
        flash_manufacturer == 0xEF &&
@@ -4105,7 +4160,8 @@ int main(void)
    /*
     * Start the microSD high-rate recorder.
     *
-    * A NEW FLTxxxx.BIN file is created on every power-up.
+    * A NEW FLTxxxx.BIN file is created on every power-up and at each
+    * 64 MiB rollover. Sequences and queued records continue across rollover.
     * Existing files are never overwritten.
     *
     * SD failure does NOT stop the rest of ATLAS.
@@ -5172,29 +5228,12 @@ static uint8_t FLASH_ChipErase(void)
 }
 static uint32_t FLASH_FindUsedBytes(void)
 {
-   uint8_t record[BLACKBOX_RECORD_SIZE];
-   for (
-       uint32_t address = BLACKBOX_START_ADDR;
-       (address + BLACKBOX_RECORD_SIZE) <= BLACKBOX_END_ADDR;
-       address += BLACKBOX_RECORD_SIZE
-   )
-   {
-       FLASH_ReadData(address, record, sizeof(record));
-       uint8_t erased = 1;
-       for (uint32_t i = 0; i < sizeof(record); i++)
-       {
-           if (record[i] != 0xFF)
-           {
-               erased = 0;
-               break;
-           }
-       }
-       if (erased)
-       {
-           return address - BLACKBOX_START_ADDR;
-       }
-   }
-   return BLACKBOX_END_ADDR - BLACKBOX_START_ADDR;
+   /* Startup already scanned the append region. Never rescan the chip from
+    * a page-opening query: that blocks telemetry and watchdog servicing.
+    */
+   uint32_t end = blackbox_next_address;
+   if (end > BLACKBOX_END_ADDR) end = BLACKBOX_END_ADDR;
+   return end - BLACKBOX_START_ADDR;
 }
 static uint8_t FLASH_VerifyErasedSamples(void)
 {
@@ -6087,7 +6126,7 @@ static void LORA_ServiceRx(void)
    /*
     * Once launch is latched, maintenance commands are ignored.
     *
-    * FLASHINFO scans the flash, FLASHCLEAR can block for a long erase, and
+    * FLASHINFO reports cached usage. FLASHCLEAR can block for a long erase, and
     * frequency changes intentionally contain delays. None of those operations
     * belong in the active-flight path.
     */
@@ -6182,13 +6221,20 @@ static void LORA_ServiceRx(void)
        uint32_t used_bytes = FLASH_FindUsedBytes();
        uint32_t total_bytes =
            BLACKBOX_END_ADDR - BLACKBOX_START_ADDR;
-       char info[96];
+       uint8_t valid = flash_present && flash_erase_result != 2U;
+       const char *state = !valid ? "FAILED" :
+           (used_bytes == 0U ? "EMPTY" :
+           (used_bytes >= total_bytes ? "FULL" : "READY"));
+       char info[160];
        snprintf(
            info,
            sizeof(info),
-           "FLASHINFO,USED=%lu,TOTAL=%lu",
+           "FLASHINFO,USED=%lu,TOTAL=%lu,FLASHSTATUS=%s,VALID=%u,VERIFY=%s,LOGGING=%s",
            (unsigned long)used_bytes,
-           (unsigned long)total_bytes
+           (unsigned long)total_bytes, state, (unsigned int)valid,
+           flash_erase_result == 1U ? "FULL" :
+               (flash_erase_result == 2U ? "FAIL" : "NOT_RUN"),
+           blackbox_ok ? "ON" : "OFF"
        );
        LORA_Send(
            (uint8_t *)info,
@@ -6246,27 +6292,21 @@ static void LORA_ServiceRx(void)
         * flight session will begin at 0x000000.
         */
        blackbox_ok = 0;
-       blackbox_next_address = BLACKBOX_START_ADDR;
+       flash_erase_result = erase_ok && verify_ok ? 1U : 2U;
+       if (flash_erase_result == 1U)
+           blackbox_next_address = BLACKBOX_START_ADDR;
        blackbox_session_start_address = BLACKBOX_START_ADDR;
        blackbox_session_number = 0;
        blackbox_record_sequence = 0;
-       if (erase_ok && verify_ok)
+       const char *completion = erase_ok && verify_ok ?
+           "FLASHCLEAR_OK,BYTES=16777216,VERIFY=FULL" :
+           "FLASHCLEAR_FAIL,VERIFY=FAIL";
+       for (uint8_t attempt = 0; attempt < 3U; attempt++)
        {
-           const char ok[] = "FLASHCLEAR_OK,BYTES=16777216,VERIFY=FULL";
-           LORA_Send(
-               (uint8_t *)ok,
-               (uint8_t)strlen(ok),
-               1000
-           );
-       }
-       else
-       {
-           const char failed[] = "FLASHCLEAR_FAIL,VERIFY=FAIL";
-           LORA_Send(
-               (uint8_t *)failed,
-               (uint8_t)strlen(failed),
-               1000
-           );
+           ATLAS_WatchdogKick();
+           LORA_Send((uint8_t *)completion, (uint8_t)strlen(completion), 1000);
+           LORA_RxContinuous();
+           HAL_Delay(80);
        }
        LORA_RxContinuous();
        return;
