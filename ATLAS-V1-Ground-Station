@@ -21,8 +21,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <math.h>
 
-I2C_HandleTypeDef hi2c1; /* Retained for existing V2 project support files. */
+I2C_HandleTypeDef hi2c1; /* SAM-M10Q on the V2 board, I2C1. */
 SPI_HandleTypeDef hspi1;
 SPI_HandleTypeDef hspi2;
 SPI_HandleTypeDef hspi3;
@@ -40,6 +41,7 @@ static uint8_t esp_rx_index = 0;
 
 static char flash_status[24] = "READY";
 static uint8_t flash_clear_pending = 0;
+static uint32_t flash_last_activity_ms = 0;
 
 #define LED1_PORT GPIOB
 #define LED1_PIN  GPIO_PIN_9
@@ -189,6 +191,521 @@ static void AT2_SD_WriteQuoted(const char *s);
 static void GS_BatteryADC_Init(void);
 static void GS_FormatBatteryVoltage(char *out, uint16_t out_size);
 
+#define GSGPS_RETRY_INTERVAL_MS 3000UL
+#define GSGPS_SERVICE_INTERVAL_MS 50UL
+#define GSGPS_I2C_ADDRESS_7BIT 0x42U
+#define GSGPS_I2C_ADDRESS ((uint16_t)(GSGPS_I2C_ADDRESS_7BIT << 1))
+#define GSGPS_CFG_I2C_ENABLED          0x10510003UL
+#define GSGPS_CFG_I2CINPROT_UBX       0x10710001UL
+#define GSGPS_CFG_I2COUTPROT_UBX      0x10720001UL
+#define GSGPS_CFG_I2COUTPROT_NMEA     0x10720002UL
+#define GSGPS_CFG_MSGOUT_NAV_PVT_I2C  0x20910006UL
+#define GSGPS_CFG_RATE_MEAS            0x30210001UL
+#define GSGPS_CFG_RATE_NAV             0x30210002UL
+#define GSGPS_CFG_NAVSPG_DYNMODEL      0x20110021UL
+#define GSGPS_DYNMODEL_AIRBORNE_4G 8U
+typedef struct
+{
+   uint8_t present;
+   uint8_t configured;
+   uint8_t fix_ok;
+   uint8_t fix_type;
+   uint8_t sats;
+   int32_t lat_e7;
+   int32_t lon_e7;
+   int32_t hmsl_mm;
+   int32_t vel_d_mmps;
+   uint32_t speed_3d_mmps;
+   /* UBX-NAV-PVT receiver estimates, captured with the valid fix. */
+   uint32_t hacc_mm;
+   uint32_t vacc_mm;
+   uint32_t sacc_mmps;
+   uint32_t itow_ms;
+   uint32_t last_message_ms;
+   uint32_t last_fix_ms;
+} GSGPS_Data_t;
+typedef struct
+{
+   uint8_t state;
+   uint8_t msg_class;
+   uint8_t msg_id;
+   uint16_t payload_len;
+   uint16_t payload_index;
+   uint8_t payload[128];
+   uint8_t ck_a;
+   uint8_t ck_b;
+   uint8_t received_ck_a;
+   uint8_t overflow;
+} GSGPS_Parser_t;
+static GSGPS_Data_t gs_gps = {0};
+static GSGPS_Parser_t gs_gps_parser = {0};
+static uint8_t GSGPS_SendUBX(uint8_t msg_class, uint8_t msg_id,
+                          const uint8_t *payload, uint16_t payload_len);
+static void GSGPS_PutU4LE(uint8_t *p, uint32_t value);
+static void GSGPS_PutU2LE(uint8_t *p, uint16_t value);
+static uint8_t GSGPS_Configure(void);
+static uint8_t GSGPS_Init(void);
+static void GSGPS_PollNavPvt(void);
+static int32_t GSGPS_ReadI4LE(const uint8_t *p);
+static void GSGPS_HandleMessage(uint8_t msg_class, uint8_t msg_id,
+                             const uint8_t *payload, uint16_t payload_len);
+static void GSGPS_FeedByte(uint8_t byte);
+static void GSGPS_Service(void);
+static void GSGPS_FormatCoordE7(char *out, size_t out_size, int32_t value_e7);
+static uint32_t GSGPS_FlightLogic_VectorMagnitude(
+   int32_t x,
+   int32_t y,
+   int32_t z
+);
+static void MX_I2C1_Init(void);
+
+static uint8_t GSGPS_SendUBX(uint8_t msg_class, uint8_t msg_id,
+                          const uint8_t *payload, uint16_t payload_len)
+{
+   if (payload_len > 80)
+   {
+       return 0;
+   }
+   uint8_t frame[88];
+   uint16_t index = 0;
+   uint8_t ck_a = 0;
+   uint8_t ck_b = 0;
+   frame[index++] = 0xB5;
+   frame[index++] = 0x62;
+   frame[index++] = msg_class;
+   frame[index++] = msg_id;
+   frame[index++] = (uint8_t)(payload_len & 0xFF);
+   frame[index++] = (uint8_t)(payload_len >> 8);
+   for (uint16_t i = 2; i < index; i++)
+   {
+       ck_a = (uint8_t)(ck_a + frame[i]);
+       ck_b = (uint8_t)(ck_b + ck_a);
+   }
+   for (uint16_t i = 0; i < payload_len; i++)
+   {
+       frame[index++] = payload[i];
+       ck_a = (uint8_t)(ck_a + payload[i]);
+       ck_b = (uint8_t)(ck_b + ck_a);
+   }
+   frame[index++] = ck_a;
+   frame[index++] = ck_b;
+   return HAL_I2C_Master_Transmit(&hi2c1,
+                                   GSGPS_I2C_ADDRESS,
+                                   frame,
+                                   index,
+                                   100) == HAL_OK;
+}
+static void GSGPS_PutU4LE(uint8_t *p, uint32_t value)
+{
+   p[0] = (uint8_t)(value & 0xFF);
+   p[1] = (uint8_t)((value >> 8) & 0xFF);
+   p[2] = (uint8_t)((value >> 16) & 0xFF);
+   p[3] = (uint8_t)((value >> 24) & 0xFF);
+}
+static void GSGPS_PutU2LE(uint8_t *p, uint16_t value)
+{
+   p[0] = (uint8_t)(value & 0xFF);
+   p[1] = (uint8_t)(value >> 8);
+}
+static uint8_t GSGPS_Configure(void)
+{
+   uint8_t payload[64] = {0};
+   uint16_t i = 0;
+   payload[i++] = 0x00;
+   payload[i++] = 0x01;
+   payload[i++] = 0x00;
+   payload[i++] = 0x00;
+   GSGPS_PutU4LE(&payload[i], GSGPS_CFG_I2C_ENABLED);
+   i += 4;
+   payload[i++] = 1;
+   GSGPS_PutU4LE(&payload[i], GSGPS_CFG_I2CINPROT_UBX);
+   i += 4;
+   payload[i++] = 1;
+   GSGPS_PutU4LE(&payload[i], GSGPS_CFG_I2COUTPROT_UBX);
+   i += 4;
+   payload[i++] = 1;
+   GSGPS_PutU4LE(&payload[i], GSGPS_CFG_I2COUTPROT_NMEA);
+   i += 4;
+   payload[i++] = 0;
+   GSGPS_PutU4LE(&payload[i], GSGPS_CFG_MSGOUT_NAV_PVT_I2C);
+   i += 4;
+   payload[i++] = 1;
+   GSGPS_PutU4LE(&payload[i], GSGPS_CFG_RATE_MEAS);
+   i += 4;
+   GSGPS_PutU2LE(&payload[i], 250);
+   i += 2;
+   GSGPS_PutU4LE(&payload[i], GSGPS_CFG_RATE_NAV);
+   i += 4;
+   GSGPS_PutU2LE(&payload[i], 1);
+   i += 2;
+   GSGPS_PutU4LE(&payload[i], GSGPS_CFG_NAVSPG_DYNMODEL);
+   i += 4;
+   payload[i++] = GSGPS_DYNMODEL_AIRBORNE_4G;
+   if (!GSGPS_SendUBX(0x06, 0x8A, payload, i))
+   {
+       return 0;
+   }
+   HAL_Delay(100);
+   return 1;
+}
+static uint8_t GSGPS_Init(void)
+{
+   if (HAL_I2C_IsDeviceReady(&hi2c1,
+                             GSGPS_I2C_ADDRESS,
+                             3,
+                             100) != HAL_OK)
+   {
+       gs_gps.present = 0;
+       gs_gps.configured = 0;
+       gs_gps.fix_ok = 0;
+       return 0;
+   }
+   gs_gps.present = 1;
+   gs_gps.configured = GSGPS_Configure();
+   gs_gps.fix_ok = 0;
+   memset(&gs_gps_parser, 0, sizeof(gs_gps_parser));
+   return 1;
+}
+static void GSGPS_PollNavPvt(void)
+{
+   if (!gs_gps.present)
+   {
+       return;
+   }
+   GSGPS_SendUBX(0x01, 0x07, NULL, 0);
+}
+static int32_t GSGPS_ReadI4LE(const uint8_t *p)
+{
+   uint32_t value =
+       ((uint32_t)p[0]) |
+       ((uint32_t)p[1] << 8) |
+       ((uint32_t)p[2] << 16) |
+       ((uint32_t)p[3] << 24);
+   return (int32_t)value;
+}
+static void GSGPS_HandleMessage(uint8_t msg_class, uint8_t msg_id,
+                             const uint8_t *payload, uint16_t payload_len)
+{
+   if (msg_class != 0x01 || msg_id != 0x07 || payload_len != 92)
+   {
+       return;
+   }
+   gs_gps.present = 1;
+   gs_gps.last_message_ms = HAL_GetTick();
+   gs_gps.fix_type = payload[20];
+   gs_gps.sats = payload[23];
+   uint8_t flags = payload[21];
+   uint8_t flags3_lsb = payload[78];
+   uint8_t invalid_llh = flags3_lsb & 0x01;
+   gs_gps.fix_ok =
+       ((flags & 0x01) != 0) &&
+       (gs_gps.fix_type >= 2) &&
+       (gs_gps.fix_type <= 4) &&
+       !invalid_llh;
+   if (gs_gps.fix_ok)
+   {
+       gs_gps.lon_e7 = GSGPS_ReadI4LE(&payload[24]);
+       gs_gps.lat_e7 = GSGPS_ReadI4LE(&payload[28]);
+       gs_gps.hmsl_mm = GSGPS_ReadI4LE(&payload[36]);
+       gs_gps.hacc_mm = (uint32_t)GSGPS_ReadI4LE(&payload[40]);
+       gs_gps.vacc_mm = (uint32_t)GSGPS_ReadI4LE(&payload[44]);
+       gs_gps.sacc_mmps = (uint32_t)GSGPS_ReadI4LE(&payload[68]);
+       gs_gps.itow_ms = (uint32_t)GSGPS_ReadI4LE(&payload[0]);
+       int32_t vel_n_mmps =
+           GSGPS_ReadI4LE(&payload[48]);
+       int32_t vel_e_mmps =
+           GSGPS_ReadI4LE(&payload[52]);
+       gs_gps.vel_d_mmps =
+           GSGPS_ReadI4LE(&payload[56]);
+       gs_gps.speed_3d_mmps =
+           GSGPS_FlightLogic_VectorMagnitude(
+               vel_n_mmps,
+               vel_e_mmps,
+               gs_gps.vel_d_mmps
+           );
+       gs_gps.last_fix_ms = gs_gps.last_message_ms;
+   }
+}
+static void GSGPS_FeedByte(uint8_t byte)
+{
+   switch (gs_gps_parser.state)
+   {
+       case 0:
+           if (byte == 0xB5)
+           {
+               gs_gps_parser.state = 1;
+           }
+           break;
+       case 1:
+           if (byte == 0x62)
+           {
+               gs_gps_parser.state = 2;
+               gs_gps_parser.ck_a = 0;
+               gs_gps_parser.ck_b = 0;
+               gs_gps_parser.payload_index = 0;
+               gs_gps_parser.overflow = 0;
+           }
+           else if (byte != 0xB5)
+           {
+               gs_gps_parser.state = 0;
+           }
+           break;
+       case 2:
+           gs_gps_parser.msg_class = byte;
+           gs_gps_parser.ck_a = (uint8_t)(gs_gps_parser.ck_a + byte);
+           gs_gps_parser.ck_b = (uint8_t)(gs_gps_parser.ck_b + gs_gps_parser.ck_a);
+           gs_gps_parser.state = 3;
+           break;
+       case 3:
+           gs_gps_parser.msg_id = byte;
+           gs_gps_parser.ck_a = (uint8_t)(gs_gps_parser.ck_a + byte);
+           gs_gps_parser.ck_b = (uint8_t)(gs_gps_parser.ck_b + gs_gps_parser.ck_a);
+           gs_gps_parser.state = 4;
+           break;
+       case 4:
+           gs_gps_parser.payload_len = byte;
+           gs_gps_parser.ck_a = (uint8_t)(gs_gps_parser.ck_a + byte);
+           gs_gps_parser.ck_b = (uint8_t)(gs_gps_parser.ck_b + gs_gps_parser.ck_a);
+           gs_gps_parser.state = 5;
+           break;
+       case 5:
+           gs_gps_parser.payload_len |= ((uint16_t)byte << 8);
+           gs_gps_parser.ck_a = (uint8_t)(gs_gps_parser.ck_a + byte);
+           gs_gps_parser.ck_b = (uint8_t)(gs_gps_parser.ck_b + gs_gps_parser.ck_a);
+           gs_gps_parser.payload_index = 0;
+           gs_gps_parser.overflow = gs_gps_parser.payload_len > sizeof(gs_gps_parser.payload);
+           gs_gps_parser.state = (gs_gps_parser.payload_len == 0) ? 7 : 6;
+           break;
+       case 6:
+           if (!gs_gps_parser.overflow &&
+               gs_gps_parser.payload_index < sizeof(gs_gps_parser.payload))
+           {
+               gs_gps_parser.payload[gs_gps_parser.payload_index] = byte;
+           }
+           gs_gps_parser.payload_index++;
+           gs_gps_parser.ck_a = (uint8_t)(gs_gps_parser.ck_a + byte);
+           gs_gps_parser.ck_b = (uint8_t)(gs_gps_parser.ck_b + gs_gps_parser.ck_a);
+           if (gs_gps_parser.payload_index >= gs_gps_parser.payload_len)
+           {
+               gs_gps_parser.state = 7;
+           }
+           break;
+       case 7:
+           gs_gps_parser.received_ck_a = byte;
+           gs_gps_parser.state = 8;
+           break;
+       case 8:
+           if (gs_gps_parser.received_ck_a == gs_gps_parser.ck_a &&
+               byte == gs_gps_parser.ck_b &&
+               !gs_gps_parser.overflow)
+           {
+               GSGPS_HandleMessage(gs_gps_parser.msg_class,
+                                 gs_gps_parser.msg_id,
+                                 gs_gps_parser.payload,
+                                 gs_gps_parser.payload_len);
+           }
+           gs_gps_parser.state = 0;
+           break;
+       default:
+           gs_gps_parser.state = 0;
+           break;
+   }
+}
+static void GSGPS_Service(void)
+{
+   static uint8_t fail_count = 0;
+   uint8_t length_bytes[2] = {0};
+   if (!gs_gps.present)
+   {
+       return;
+   }
+   if (HAL_I2C_Mem_Read(&hi2c1,
+                        GSGPS_I2C_ADDRESS,
+                        0xFD,
+                        I2C_MEMADD_SIZE_8BIT,
+                        length_bytes,
+                        2,
+                        30) != HAL_OK)
+   {
+       fail_count++;
+       if (fail_count >= 5)
+       {
+           gs_gps.present = 0;
+           gs_gps.configured = 0;
+           gs_gps.fix_ok = 0;
+           fail_count = 0;
+       }
+       return;
+   }
+   fail_count = 0;
+   uint16_t available = ((uint16_t)length_bytes[0] << 8) | length_bytes[1];
+   if (available == 0)
+   {
+       if (gs_gps.last_message_ms != 0 &&
+           (HAL_GetTick() - gs_gps.last_message_ms) > 2000UL)
+       {
+           gs_gps.fix_ok = 0;
+       }
+       return;
+   }
+   if (available > 512)
+   {
+       available = 512;
+   }
+   uint8_t buffer[128];
+   while (available > 0)
+   {
+       uint16_t chunk = available > sizeof(buffer) ? sizeof(buffer) : available;
+       if (HAL_I2C_Mem_Read(&hi2c1,
+                            GSGPS_I2C_ADDRESS,
+                            0xFF,
+                            I2C_MEMADD_SIZE_8BIT,
+                            buffer,
+                            chunk,
+                            50) != HAL_OK)
+       {
+           break;
+       }
+       for (uint16_t i = 0; i < chunk; i++)
+       {
+           GSGPS_FeedByte(buffer[i]);
+       }
+       available -= chunk;
+   }
+   if (gs_gps.last_message_ms != 0 &&
+       (HAL_GetTick() - gs_gps.last_message_ms) > 2000UL)
+   {
+       gs_gps.fix_ok = 0;
+   }
+}
+static void GSGPS_FormatCoordE7(char *out, size_t out_size, int32_t value_e7)
+{
+   int64_t value = value_e7;
+   const char *sign = "";
+   if (value < 0)
+   {
+       sign = "-";
+       value = -value;
+   }
+   snprintf(out,
+            out_size,
+            "%s%ld.%07ld",
+            sign,
+            (long)(value / 10000000LL),
+            (long)(value % 10000000LL));
+}
+static uint32_t GSGPS_FlightLogic_VectorMagnitude(
+   int32_t x,
+   int32_t y,
+   int32_t z
+)
+{
+   float xf = (float)x;
+   float yf = (float)y;
+   float zf = (float)z;
+   float magnitude =
+       sqrtf(
+           xf * xf +
+           yf * yf +
+           zf * zf
+       );
+   if (magnitude <= 0.0f)
+   {
+       return 0;
+   }
+   if (magnitude >= 4294967040.0f)
+   {
+       return 0xFFFFFFFFUL;
+   }
+   return (uint32_t)(magnitude + 0.5f);
+}
+static void MX_I2C1_Init(void)
+{
+   hi2c1.Instance = I2C1;
+   hi2c1.Init.ClockSpeed = 200000;
+   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+   hi2c1.Init.OwnAddress1 = 0;
+   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+   hi2c1.Init.OwnAddress2 = 0;
+   hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+   hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+   if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+   {
+       Error_Handler();
+   }
+}
+
+static void GSGPS_Task(void)
+{
+    static uint32_t service_ms = 0, poll_ms = 0, retry_ms = 0, report_ms = 0;
+    uint32_t now = HAL_GetTick();
+    if (now - service_ms >= 50UL) {
+        service_ms = now;
+        GSGPS_Service();
+    }
+    if (gs_gps.present && now - poll_ms >= 500UL) {
+        poll_ms = now;
+        GSGPS_PollNavPvt();
+    }
+    if ((!gs_gps.present || !gs_gps.configured) && now - retry_ms >= 3000UL) {
+        retry_ms = now;
+        if (!gs_gps.present) GSGPS_Init();
+        else gs_gps.configured = GSGPS_Configure();
+    }
+    now = HAL_GetTick();
+    if (now - report_ms < 1000UL) return;
+    report_ms = now;
+    uint8_t fresh = gs_gps.last_message_ms != 0U &&
+        now - gs_gps.last_message_ms <= 2000UL;
+    uint8_t fix = gs_gps.present && fresh && gs_gps.fix_ok &&
+        gs_gps.last_fix_ms != 0U && now - gs_gps.last_fix_ms <= 2000UL;
+    char lat[20] = "---", lon[20] = "---", line[192];
+    if (fix) {
+        GSGPS_FormatCoordE7(lat, sizeof(lat), gs_gps.lat_e7);
+        GSGPS_FormatCoordE7(lon, sizeof(lon), gs_gps.lon_e7);
+    }
+    snprintf(line, sizeof(line),
+        "GS,GSGPS=%s,GSFIX=%u,GSSATS=%u,GSLAT=%s,GSLON=%s,GSAGE=%lu",
+        !gs_gps.present ? "FAIL" : (!fresh ? "STALE" : (fix ? "FIX" : "NOFIX")),
+        (unsigned int)(fix ? gs_gps.fix_type : 0U),
+        (unsigned int)(fresh ? gs_gps.sats : 0U), lat, lon,
+        (unsigned long)(gs_gps.last_fix_ms ? now - gs_gps.last_fix_ms : UINT32_MAX));
+    ESP_SendLine(line);
+
+    /* One local GPS diagnostic row per second, alongside AT1/ATSTAT rows.
+     * Keep the existing three CSV columns and ESP wire message unchanged.
+     * raw_radio_packet also holds these LOCAL records, identified by GSGPS=.
+     * GSALTMM is MSL altitude, GSVDMMPS is positive down, GSSPDMMPS is 3-D.
+     * HACC/VACC are receiver position accuracy estimates in mm; SACC is mm/s.
+     * Missing/stale fixes use --- rather than reusing old measurements.
+     * GSAGE is fix age; GSMSGAGE is age of the latest accepted NAV-PVT.
+     * GSITOWMS identifies the valid fix's GNSS epoch (GPS time of week).
+     */
+    char measurements[224];
+    if (fix) {
+        snprintf(measurements, sizeof(measurements),
+            "GSALTMM=%ld,GSVDMMPS=%ld,GSSPDMMPS=%lu,"
+            "GSHACCMM=%lu,GSVACCMM=%lu,GSSACCMMPS=%lu,GSITOWMS=%lu",
+            (long)gs_gps.hmsl_mm, (long)gs_gps.vel_d_mmps,
+            (unsigned long)gs_gps.speed_3d_mmps,
+            (unsigned long)gs_gps.hacc_mm, (unsigned long)gs_gps.vacc_mm,
+            (unsigned long)gs_gps.sacc_mmps, (unsigned long)gs_gps.itow_ms);
+    } else {
+        snprintf(measurements, sizeof(measurements),
+            "GSALTMM=---,GSVDMMPS=---,GSSPDMMPS=---,"
+            "GSHACCMM=---,GSVACCMM=---,GSSACCMMPS=---,GSITOWMS=---");
+    }
+    char log_line[448];
+    int log_length = snprintf(log_line, sizeof(log_line),
+        "%s,GSMSGAGE=%lu,%s", line + 3,
+        (unsigned long)(gs_gps.last_message_ms ?
+            now - gs_gps.last_message_ms : UINT32_MAX), measurements);
+    if (log_length > 0 && (size_t)log_length < sizeof(log_line)) {
+        AT2_SD_LogPacket(log_line, line);
+    }
+}
+
 int main(void)
 {
     HAL_Init();
@@ -196,6 +713,8 @@ int main(void)
     MX_GPIO_Init();
     MX_SPI1_Init();
     MX_USART1_UART_Init();
+    MX_I2C1_Init();
+    GSGPS_Init();
     MX_SPI2_Init();
     MX_FATFS_Init();
     AT2_SD_Init();
@@ -222,7 +741,7 @@ int main(void)
 
     uint8_t rx_buf[256];
     char raw[256];
-    char esp_line[400];
+    char esp_line[768];
 
     uint32_t last_gs_battery_send = 0;
     char gs_battery_value[16];
@@ -231,7 +750,14 @@ int main(void)
     while (1)
     {
     	ESP_ReadCommands();
+        GSGPS_Task();
         GS_ServiceMainAltitudeCommand();
+        if (flash_clear_pending &&
+            HAL_GetTick() - flash_last_activity_ms >= 240000UL)
+        {
+            flash_clear_pending = 0;
+            GS_SendFlashStatus("TIMEOUT");
+        }
 
         if ((HAL_GetTick() - last_gs_battery_send) >= 1000)
         {
@@ -269,9 +795,29 @@ int main(void)
 
             raw[sizeof(raw) - 1] = 0;
 
+            /* Forward onboard test acknowledgements and continuity unchanged. */
+            if (strncmp(raw, "GTEST,", 6) == 0 ||
+                strncmp(raw, "ATSTAT,", 7) == 0)
+            {
+                char status_line[272];
+                snprintf(status_line, sizeof(status_line), "GS,%s", raw);
+                ESP_SendLine(status_line);
+                /* Preserve each received speed/Mach/continuity status packet
+                 * as its own timestamped CSV row, including invalid/stale
+                 * quality flags. Never merge it with an older AT1 sample.
+                 */
+                if (strncmp(raw, "ATSTAT,", 7) == 0)
+                {
+                    AT2_SD_LogPacket(raw, status_line);
+                }
+                /* Already in continuous RX. Preserve newly received packets. */
+                continue;
+            }
             if (strncmp(raw, "FLASHINFO,", 10) == 0)
             {
-                char info_line[128];
+                char info_line[192];
+                /* A reply proves the blocking erase handler has returned. */
+                flash_clear_pending = 0;
 
                 snprintf(
                     info_line,
@@ -281,37 +827,37 @@ int main(void)
                 );
 
                 ESP_SendLine(info_line);
-                LORA_RxContinuous();
                 continue;
             }
 
             if (strcmp(raw, "FLASHCLEAR_PROGRESS") == 0)
             {
                 flash_clear_pending = 1;
+                flash_last_activity_ms = HAL_GetTick();
                 GS_SendFlashStatus("CLEARING");
-                LORA_RxContinuous();
                 continue;
             }
 
             if (strcmp(raw, "FLASHVERIFY_STARTED") == 0)
             {
                 flash_clear_pending = 1;
+                flash_last_activity_ms = HAL_GetTick();
                 GS_SendFlashStatus("VERIFYING");
-                LORA_RxContinuous();
                 continue;
             }
 
             if (strcmp(raw, "FLASHVERIFY_PROGRESS") == 0)
             {
                 flash_clear_pending = 1;
+                flash_last_activity_ms = HAL_GetTick();
                 GS_SendFlashStatus("VERIFYING");
-                LORA_RxContinuous();
                 continue;
             }
 
             if (strncmp(raw, "FLASHCLEAR_STARTED", 18) == 0)
             {
                 flash_clear_pending = 1;
+                flash_last_activity_ms = HAL_GetTick();
                 strncpy(
                     flash_status,
                     "CLEARING",
@@ -320,7 +866,6 @@ int main(void)
                 flash_status[sizeof(flash_status) - 1] = '\0';
 
                 GS_SendFlashStatus("CLEARING");
-                LORA_RxContinuous();
                 continue;
             }
 
@@ -347,7 +892,6 @@ int main(void)
                 );
 
                 ESP_SendLine(proof_line);
-                LORA_RxContinuous();
                 continue;
             }
 
@@ -365,7 +909,6 @@ int main(void)
                     "GS,FLASHSTATUS=FAILED,VERIFY=FAIL"
                 );
 
-                LORA_RxContinuous();
                 continue;
             }
 
@@ -570,14 +1113,12 @@ int main(void)
                     );
                 }
 
+                /* Resume RX before UART output or SD work. */
+                LORA_RxContinuous();
                 ESP_SendLine(esp_line);
 
-                LED_Blink(
-                    LED2_PORT,
-                    LED2_PIN,
-                    2,
-                    60
-                );
+                /* Non-blocking packet indicator keeps UART command polling live. */
+                HAL_GPIO_TogglePin(LED2_PORT, LED2_PIN);
 
                 HAL_GPIO_TogglePin(
                     LED1_PORT,
@@ -588,6 +1129,8 @@ int main(void)
                     raw,
                     esp_line
                 );
+                /* Do not clear IRQ flags for a packet arriving during SD work. */
+                continue;
             }
 
             LORA_RxContinuous();
@@ -716,6 +1259,7 @@ static void GS_FormatBatteryVoltage(char *out, uint16_t out_size)
 static void MakeDataLine(char *raw, char *out, uint16_t out_size)
 {
     char pkt[20];
+    char flight_state[12], arm_state[12], baro_trust[12], event_flags[12];
     char a1ft[20];
     char descfts[20];
     char mach[16];
@@ -741,6 +1285,10 @@ static void MakeDataLine(char *raw, char *out, uint16_t out_size)
     char gs_battery[16];
 
     GetValue(raw, "PKT", pkt, sizeof(pkt));
+    GetValue(raw, "FS", flight_state, sizeof(flight_state));
+    GetValue(raw, "ARM", arm_state, sizeof(arm_state));
+    GetValue(raw, "BT", baro_trust, sizeof(baro_trust));
+    GetValue(raw, "EV", event_flags, sizeof(event_flags));
     GetValue(raw, "A1FT", a1ft, sizeof(a1ft));
     GetValue(raw, "DESCFTS", descfts, sizeof(descfts));
     GetValue(raw, "MACH", mach, sizeof(mach));
@@ -783,7 +1331,7 @@ static void MakeDataLine(char *raw, char *out, uint16_t out_size)
     snprintf(
         out,
         out_size,
-        "DATA,PKT=%s,A1FT=%s,A2FT=0.0,DESCFTS=%s,MACH=%s,"
+        "DATA,PKT=%s,FS=%s,ARM=%s,BT=%s,EV=%s,A1FT=%s,A2FT=0.0,DESCFTS=%s,MACH=%s,"
         "AX=%s,AY=%s,AZ=%s,"
         "GX=%s,GY=%s,GZ=%s,"
         "I1=%s,I2=%s,GPS=%s,FIX=%s,SATS=%s,"
@@ -791,6 +1339,7 @@ static void MakeDataLine(char *raw, char *out, uint16_t out_size)
         "RFHZ=%s,BATV=%s,GSBATV=%s,"
         "RSSI=%d,SNR=%d.%02d",
         pkt,
+        flight_state, arm_state, baro_trust, event_flags,
         a1ft,
         descfts,
         mach,
@@ -986,6 +1535,16 @@ static void ESP_ReadCommands(void)
 
 static void ESP_HandleCommand(const char *command)
 {
+    if (strncmp(command, "GT,", 3) == 0)
+    {
+        char radio_command[80];
+        int count = snprintf(radio_command, sizeof(radio_command), "CMD,%s", command);
+        if (count > 0 && count < (int)sizeof(radio_command))
+            LORA_Send((uint8_t *)radio_command, (uint8_t)count, 1000);
+        LORA_RxContinuous();
+        return;
+    }
+
     if (strcmp(command, "FLASHINFO") == 0)
     {
         const char query[] = "CMD,FLASHINFO";
@@ -1025,6 +1584,7 @@ static void ESP_HandleCommand(const char *command)
         if (GS_SendFlashClearCommand())
         {
             flash_clear_pending = 1;
+            flash_last_activity_ms = HAL_GetTick();
 
             strncpy(
                 flash_status,
@@ -1035,7 +1595,6 @@ static void ESP_HandleCommand(const char *command)
 
             GS_SendFlashStatus("COMMAND_SENT");
 
-            LORA_RxContinuous();
         }
         else
         {
@@ -1050,7 +1609,6 @@ static void ESP_HandleCommand(const char *command)
 
             GS_SendFlashStatus("SEND_FAILED");
 
-            LORA_RxContinuous();
         }
 
         return;
@@ -1066,7 +1624,7 @@ static void ESP_HandleCommand(const char *command)
             );
         }
 
-        LORA_RxContinuous();
+        /* The send helper already enabled RX. Preserve a pending reply. */
         return;
     }
 
@@ -1132,8 +1690,7 @@ static void ESP_HandleCommand(const char *command)
                 "COMMAND_SENT",
                 current_main_altitude_ft
             );
-
-            LORA_RxContinuous();
+            /* Keep RX active and preserve any ACK received during UART output. */
         }
         else
         {
@@ -1319,11 +1876,14 @@ static uint8_t GS_SendMainAltitudeCommand(
         (unsigned long)altitude_ft
     );
 
-    return LORA_Send(
+    uint8_t sent = LORA_Send(
         (uint8_t *)command,
         (uint8_t)strlen(command),
         1000
     );
+    /* Listen before any blocking UART status output. */
+    LORA_RxContinuous();
+    return sent;
 }
 
 static uint8_t GS_SendHealthQuery(void)
@@ -1331,11 +1891,14 @@ static uint8_t GS_SendHealthQuery(void)
     const char command[] =
         "CMD,HEALTH";
 
-    return LORA_Send(
+    uint8_t sent = LORA_Send(
         (uint8_t *)command,
         (uint8_t)strlen(command),
         1000
     );
+    /* Receive the onboard reply before UART reporting resumes. */
+    LORA_RxContinuous();
+    return sent;
 }
 
 static void GS_ServiceMainAltitudeCommand(void)
@@ -1381,11 +1944,13 @@ static uint8_t GS_SendFlashClearCommand(void)
     const char command[] =
         "CMD,FLASHCLEAR,CONFIRM=ERASE_W25Q128";
 
-    return LORA_Send(
+    uint8_t sent = LORA_Send(
         (uint8_t *)command,
         (uint8_t)strlen(command),
         1000
     );
+    LORA_RxContinuous();
+    return sent;
 }
 
 static uint8_t GS_SendFrequencyCommand(
@@ -1401,11 +1966,14 @@ static uint8_t GS_SendFrequencyCommand(
         (unsigned long)frequency_hz
     );
 
-    return LORA_Send(
+    uint8_t sent = LORA_Send(
         (uint8_t *)command,
         strlen(command),
         1000
     );
+    /* Listen before any blocking UART status output. */
+    LORA_RxContinuous();
+    return sent;
 }
 
 static uint8_t GS_WaitForFrequencyAck(
@@ -1415,7 +1983,9 @@ static uint8_t GS_WaitForFrequencyAck(
     uint8_t buffer[64];
     uint32_t start_time = HAL_GetTick();
 
-    LORA_RxContinuous();
+    /* GS_SendFrequencyCommand already enabled RX. Restarting RX here
+     * clears IRQ flags and could discard an ACK received during UART output.
+     */
 
     while (
         (HAL_GetTick() - start_time) <
@@ -1781,7 +2351,7 @@ static void AT2_SD_Init(void)
     }
 
     const char *header =
-        "ms,raw_at1_packet,esp32_line\r\n";
+        "ms,raw_radio_packet,esp32_line\r\n";
 
     res =
         f_write(
