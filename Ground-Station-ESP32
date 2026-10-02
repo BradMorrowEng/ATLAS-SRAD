@@ -9,8 +9,8 @@
 const char* AP_NAME = "ATLAS-GS";
 const char* AP_PASS = "ATLAS915";
 
-#define ATLAS_RX_PIN 32
-#define ATLAS_TX_PIN 33
+#define ATLAS_RX_PIN 33
+#define ATLAS_TX_PIN 32
 #define ATLAS_BAUD 115200
 
 #define GS_GPS_RX_PIN 34
