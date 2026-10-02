@@ -1,7 +1,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
-#include <TinyGPSPlus.h>
 #include <SPI.h>
 #include <SD.h>
 #include <math.h>
@@ -13,9 +12,6 @@ const char* AP_PASS = "ATLAS915";
 #define ATLAS_TX_PIN 32
 #define ATLAS_BAUD 115200
 
-#define GS_GPS_RX_PIN 34
-#define GS_GPS_TX_PIN -1
-#define GS_GPS_BAUD 9600
 
 #define SD_SCK_PIN 18
 #define SD_MISO_PIN 19
@@ -33,14 +29,29 @@ const char* AP_PASS = "ATLAS915";
 WebServer server(80);
 
 HardwareSerial AtlasSerial(2);
-HardwareSerial GroundGpsSerial(1);
 
-TinyGPSPlus groundGps;
 
 SPIClass sdSPI(VSPI);
 
 String inputLine = "";
 String latestLine = "";
+String flightStateCode = "";
+String armStateCode = "";
+String baroTrustCode = "";
+String eventFlagsHex = "";
+String machEstimate = "", gpsSpeedMmps = "", gpsSpeedAccuracyMmps = "";
+String gpsSpeedQuality = "WAITING";
+unsigned long speedTelemetryMs = 0;
+bool speedTelemetryReceived = false;
+String continuityApo = "", continuityMain = "";
+unsigned long continuityReplyMs = 0;
+bool continuityReceived = false;
+String gtReplyState = "IDLE", gtReplyChannel = "NONE", gtReplyFlight = "";
+String gtPending = "";
+unsigned long gtReplyId = 0, gtExpectedId = 0, gtReplyLeft = 0;
+unsigned long gtReplyMs = 0, gtRequestMs = 0, gtLastPollMs = 0;
+bool gtReceived = false, gtCancelRequested = false, gtPollSent = false;
+
 
 unsigned long packetCount = 0;
 unsigned long lastPacketTime = 0;
@@ -51,6 +62,36 @@ double groundLatitude = 0.0;
 double groundLongitude = 0.0;
 
 unsigned long groundLastFixTime = 0;
+unsigned long groundGpsReportTime = 0;
+uint32_t groundGpsReportedAge = UINT32_MAX;
+uint32_t groundGpsSatellites = 0;
+bool groundGpsFix = false;
+String groundGpsStatus = "WAITING";
+
+String getValue(const String& line, const String& key);
+bool stringToDouble(const String& text, double& result);
+void parseGroundGpsLine(const String& line)
+{
+  String state = getValue(line, "GSGPS");
+  if (state.length() == 0) return;
+  groundGpsReportTime = millis();
+  groundGpsStatus = state;
+  groundGpsSatellites = (uint32_t)getValue(line, "GSSATS").toInt();
+  String age = getValue(line, "GSAGE");
+  groundGpsReportedAge = age.length() ? strtoul(age.c_str(), NULL, 10) : UINT32_MAX;
+  groundGpsFix = false;
+  double lat, lon;
+  if (state == "FIX" && groundGpsReportedAge <= 2000UL &&
+      stringToDouble(getValue(line, "GSLAT"), lat) &&
+      stringToDouble(getValue(line, "GSLON"), lon) &&
+      lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0)
+  {
+    groundLatitude = lat;
+    groundLongitude = lon;
+    groundLastFixTime = millis() - groundGpsReportedAge;
+    groundGpsFix = true;
+  }
+}
 
 String trackerName = "ATLAS";
 String pkt = "";
@@ -83,6 +124,10 @@ String currentMainAltitudeFt = "";
 String requestedMainAltitudeFt = "";
 String mainAltitudeStatus = "UNKNOWN";
 unsigned long mainAltitudeCommandTime = 0;
+// Startup sync retries until an onboard value is confirmed.
+bool mainAltitudeSyncPending = true;
+unsigned long mainAltitudeSyncLastMs = 0;
+uint8_t mainAltitudeSyncAttempts = 0;
 #define MAIN_ALTITUDE_COMMAND_TIMEOUT_MS 8000UL
 
 String flashStatus = "READY";
@@ -93,6 +138,11 @@ String flashTotalBytes = "16777216";
 bool flashMaintenanceActive = false;
 unsigned long flashCommandTime = 0;
 unsigned long flashInfoRequestTime = 0;
+unsigned long flashLastProgressTime = 0;
+unsigned long flashRecoveryQueryTime = 0;
+bool flashUsageValid = false;
+String flashInfoStatus = "WAITING";
+String flashLogging = "UNKNOWN";
 #define FLASH_COMMAND_TIMEOUT_MS 240000UL
 
 unsigned long frequencyCommandTime = 0;
@@ -1022,6 +1072,7 @@ const flashPanelFull =
       );
 
     function requestFlashInfoPanel() {
+      if (!flashPanelFull.classList.contains("open")) return;
       atlasPanelMessage.innerText =
         "Reading flash usage...";
 
@@ -1029,15 +1080,17 @@ const flashPanelFull =
         "/flash-info",
         { method: "POST" }
       )
+        .then(response => { if (!response.ok) throw new Error("Rejected"); })
         .catch(() => {
-          atlasPanelMessage.innerText =
-            "Flash info request failed";
+          atlasPanelMessage.innerText = "Flash info request failed";
         });
     }
 
+    setInterval(requestFlashInfoPanel, 10000);
     window.addEventListener(
       "message",
       event => {
+        if (event.source !== document.getElementById("atlasUiFrame").contentWindow) return;
         if (event.data === "ATLAS_OPEN_FLASH")
         {
           flashPanelFull.classList.add("open");
@@ -1149,7 +1202,8 @@ const flashPanelFull =
 
           const flashPanelBusy =
             currentFlashStatus === "COMMAND_SENT" ||
-            currentFlashStatus === "CLEARING";
+            currentFlashStatus === "CLEARING" ||
+            currentFlashStatus === "VERIFYING";
 
           atlasPanelClear.disabled =
             flashPanelBusy;
@@ -1170,7 +1224,7 @@ const flashPanelFull =
             atlasPanelVerify.style.color =
               "#00ee91";
             atlasPanelMessage.innerText =
-              "Flash is empty and ready.";
+              "Erase verified. Black-box logging stays off until onboard power is cycled.";
             atlasPanelClear.disabled = false;
             atlasPanelReturn.disabled = false;
           }
@@ -1181,7 +1235,7 @@ const flashPanelFull =
             atlasPanelVerify.style.color =
               "#ffba52";
             atlasPanelMessage.innerText =
-              "Erasing flash... ATLAS V2 is still connected.";
+              "Erasing flash. Flight telemetry pauses during this operation.";
           }
           else if (data.flashStatus === "VERIFYING")
           {
@@ -1231,6 +1285,18 @@ const flashPanelFull =
             atlasPanelReturn.disabled = false;
           }
 
+          if (!flashPanelBusy) {
+            if (!data.flashUsageValid) {
+              atlasPanelUsed.innerText = "--";
+              atlasPanelAvailable.innerText = "--";
+              atlasPanelPercent.innerText = "Usage unknown";
+              atlasFlashUsageInner.style.width = "0%";
+            }
+            if (data.flashInfoStatus === "WAITING")
+              atlasPanelMessage.innerText = "Reading flash usage...";
+            else if (data.flashInfoStatus === "TIMEOUT" || data.flashInfoStatus === "SEND_FAILED")
+              atlasPanelMessage.innerText = "No fresh flash reply. Showing last known usage.";
+          }
           updateLoraDisplay(data);
 
           button.innerText =
@@ -1648,6 +1714,11 @@ void parseDataLine(const String& line)
   }
 
   latestLine = line;
+  // Replace each value on every packet so missing fields never retain old status.
+  flightStateCode = getValue(line, "FS");
+  armStateCode = getValue(line, "ARM");
+  baroTrustCode = getValue(line, "BT");
+  eventFlagsHex = getValue(line, "EV");
 
   packetCount++;
 
@@ -1821,8 +1892,168 @@ saveField(
   Serial.println(line);
 }
 
+/* Ground-test actions are acknowledged by the onboard controller. */
+bool groundTestActiveState(const String& state)
+{
+  return state == "ARMED" || state == "COUNTDOWN" || state == "FIRING";
+}
+
+void groundTestSend(const String& action, unsigned long id)
+{
+  AtlasSerial.print("GT," + action + "," + String(id) + "\r\n");
+}
+
+void groundTestReceive(const String& line)
+{
+  if (!line.startsWith("GS,GTEST,") && !line.startsWith("GS,ATSTAT,")) return;
+  String apo = getValue(line, "APOC");
+  String main = getValue(line, "MAINC");
+  if ((apo == "0" || apo == "1" || apo == "2") &&
+      (main == "0" || main == "1" || main == "2")) {
+    continuityApo = apo;
+    continuityMain = main;
+    continuityReceived = true;
+    continuityReplyMs = millis();
+  }
+  if (line.startsWith("GS,ATSTAT,")) {
+    // Explicit invalid fields clear the prior estimate. Missing data is not zero.
+    machEstimate = "";
+    gpsSpeedQuality = getValue(line, "GPSQ");
+    gpsSpeedMmps = getValue(line, "SPDMMPS");
+    gpsSpeedAccuracyMmps = getValue(line, "SACCMMPS");
+    speedTelemetryReceived = true;
+    speedTelemetryMs = millis();
+    String candidate = getValue(line, "MACH");
+    char *end = NULL;
+    float value = strtof(candidate.c_str(), &end);
+    if (gpsSpeedQuality == "OK" && end != candidate.c_str() && *end == '\0' &&
+        isfinite(value) && value >= 0.0f && value < 5.0f) machEstimate = candidate;
+  }
+  if (!line.startsWith("GS,GTEST,")) return;
+  String state = getValue(line, "STATE");
+  if (state != "IDLE" && state != "ARMED" && state != "COUNTDOWN" &&
+      state != "FIRING" && state != "DONE" && state != "CANCELLED") return;
+  gtReplyId = strtoul(getValue(line, "ID").c_str(), NULL, 10);
+  gtReplyState = state;
+  gtReplyChannel = getValue(line, "CH");
+  gtReplyLeft = strtoul(getValue(line, "LEFT").c_str(), NULL, 10);
+  gtReplyFlight = getValue(line, "FS");
+  gtReplyMs = millis();
+  gtReceived = true;
+  if (gtCancelRequested && !groundTestActiveState(state)) {
+    // Also acknowledge cancellation when the earlier ARM never reached onboard.
+    gtExpectedId = gtReplyId;
+    gtCancelRequested = false;
+    gtPending = "";
+  }
+  if (gtReplyId == gtExpectedId) {
+    bool acknowledged =
+      (gtPending == "arm" && state == "ARMED") ||
+      (gtPending == "go" && (state == "COUNTDOWN" || state == "FIRING" || state == "DONE")) ||
+      (gtPending == "cancel" && !groundTestActiveState(state));
+    if (acknowledged) gtPending = "";
+    if (!groundTestActiveState(state)) {
+      gtCancelRequested = false;
+      gtPending = "";
+    }
+  }
+}
+
+void groundTestJson()
+{
+  unsigned long age = gtReceived ? millis() - gtReplyMs : 0;
+  String json = "{\"received\":" + String(gtReceived ? "true" : "false");
+  json += ",\"age\":" + String(age);
+  json += ",\"state\":\"" + gtReplyState + "\"";
+  json += ",\"channel\":\"" + gtReplyChannel + "\"";
+  json += ",\"id\":" + String(gtReplyId);
+  json += ",\"expectedId\":" + String(gtExpectedId);
+  json += ",\"left\":" + String(gtReplyLeft);
+  json += ",\"flightState\":\"" + escapeJson(gtReplyFlight) + "\"";
+  json += ",\"pending\":\"" + gtPending + "\"";
+  json += ",\"cancelling\":" + String(gtCancelRequested ? "true" : "false");
+  json += ",\"continuityReceived\":" + String(continuityReceived ? "true" : "false");
+  json += ",\"continuityAge\":" + String(continuityReceived ? millis() - continuityReplyMs : 0);
+  json += ",\"apo\":\"" + escapeJson(continuityApo) + "\"";
+  json += ",\"main\":\"" + escapeJson(continuityMain) + "\"}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+void handleGroundTestStatus()
+{
+  unsigned long now = millis();
+  if (gtPending.length() && now - gtRequestMs >= 2500UL && !gtCancelRequested) {
+    // An uncertain arm/start is cancelled, never retried automatically.
+    gtPending = "cancel";
+    gtCancelRequested = true;
+  }
+  // Heartbeats exist only while this page requests status. Closing it stops them.
+  if (!gtPollSent || now - gtLastPollMs >= 650UL) {
+    gtLastPollMs = now;
+    gtPollSent = true;
+    if (gtCancelRequested) groundTestSend("CANCEL", gtExpectedId);
+    else {
+      unsigned long id = gtPending.length() ? gtExpectedId : gtReplyId;
+      groundTestSend("POLL", id);
+    }
+  }
+  groundTestJson();
+}
+
+void handleGroundTest()
+{
+  String action = server.arg("action");
+  bool fresh = gtReceived && millis() - gtReplyMs < 2000UL;
+  if (action == "cancel") {
+    if (!gtPending.length()) gtExpectedId = gtReplyId;
+    gtCancelRequested = true;
+    gtPending = "cancel";
+    gtRequestMs = millis();
+    groundTestSend("CANCEL", gtExpectedId);
+    groundTestJson();
+    return;
+  }
+  if (!fresh || gtReplyFlight != "1" || gtPending.length() || gtCancelRequested) {
+    server.send(409, "text/plain", "Waiting for fresh onboard confirmation.");
+    return;
+  }
+  String channel = server.arg("channel");
+  if (channel != "MAIN" && channel != "APO") {
+    server.send(400, "text/plain", "Select MAIN or APO.");
+    return;
+  }
+  if (action == "arm" && !groundTestActiveState(gtReplyState)) {
+    // Onboard accepts only its next ID. Completed commands cannot be replayed.
+    gtExpectedId = gtReplyId + 1UL;
+    gtPending = "arm";
+    gtRequestMs = millis();
+    groundTestSend("ARM," + channel, gtExpectedId);
+  } else if (action == "go" && gtReplyState == "ARMED" && channel == gtReplyChannel) {
+    gtExpectedId = gtReplyId;
+    gtPending = "go";
+    gtRequestMs = millis();
+    groundTestSend("GO", gtExpectedId);
+  } else {
+    server.send(409, "text/plain", "That action is not available in the current onboard state.");
+    return;
+  }
+  groundTestJson();
+}
+
+static bool mainAltitudeValueValid(const String &value)
+{
+  if (value.length() == 0 || value.length() > 5) return false;
+  for (size_t i = 0; i < value.length(); i++)
+    if (value[i] < '0' || value[i] > '9') return false;
+  unsigned long altitude = strtoul(value.c_str(), NULL, 10);
+  return altitude >= 100UL && altitude <= 10000UL;
+}
+
 void parseGroundStationLine(const String& line)
 {
+  parseGroundGpsLine(line);
+  groundTestReceive(line);
   if (!line.startsWith("GS,"))
   {
     return;
@@ -1851,17 +2082,22 @@ void parseGroundStationLine(const String& line)
       "TOTAL"
     );
 
-  if (receivedFlashUsed.length() > 0)
+  if (line.startsWith("GS,FLASHINFO,") &&
+      receivedFlashUsed.length() > 0 && receivedFlashTotal.length() > 0)
   {
-    flashUsedBytes =
-      receivedFlashUsed;
+    flashUsedBytes = receivedFlashUsed;
+    flashTotalBytes = receivedFlashTotal;
+    flashUsageValid = getValue(line, "VALID") != "0";
     flashInfoRequestTime = 0;
+    flashInfoStatus = "READY";
+    flashLogging = getValue(line, "LOGGING");
+    flashMaintenanceActive = false;
+    flashCommandTime = 0;
   }
-
-  if (receivedFlashTotal.length() > 0)
-  {
-    flashTotalBytes =
-      receivedFlashTotal;
+  String infoStatus = getValue(line, "FLASHINFOSTATUS");
+  if (infoStatus.length() > 0) {
+    flashInfoStatus = infoStatus;
+    flashInfoRequestTime = 0;
   }
 
   String receivedFlashStatus =
@@ -1874,6 +2110,9 @@ void parseGroundStationLine(const String& line)
   {
     flashStatus =
       receivedFlashStatus;
+    if (receivedFlashStatus == "FAILED") flashUsageValid = false;
+    if (receivedFlashStatus == "CLEARING" || receivedFlashStatus == "VERIFYING")
+      flashLastProgressTime = millis();
 
     flashMaintenanceActive =
       receivedFlashStatus == "COMMAND_SENT" ||
@@ -1905,7 +2144,10 @@ void parseGroundStationLine(const String& line)
     if (
       receivedFlashStatus == "EMPTY" ||
       receivedFlashStatus == "FAILED" ||
-      receivedFlashStatus == "SEND_FAILED"
+      receivedFlashStatus == "SEND_FAILED" ||
+      receivedFlashStatus == "TIMEOUT" ||
+      receivedFlashStatus == "READY" ||
+      receivedFlashStatus == "FULL"
     )
     {
       flashMaintenanceActive = false;
@@ -1916,6 +2158,9 @@ void parseGroundStationLine(const String& line)
         flashVerify == "FULL"
       )
       {
+        flashUsageValid = true;
+        flashInfoStatus = "READY";
+        flashInfoRequestTime = 0;
         flashUsedBytes = "0";
         flashTotalBytes = "16777216";
       }
@@ -1929,12 +2174,17 @@ void parseGroundStationLine(const String& line)
     );
 
   if (
-    receivedMainAltitude.length() > 0 &&
-    receivedMainAltitude != "UNKNOWN"
+    mainAltitudeValueValid(receivedMainAltitude)
   )
   {
     currentMainAltitudeFt =
       receivedMainAltitude;
+    // Only an onboard readback or accepted set reply completes sync.
+    if (line.indexOf("GS,HEALTH,") == 0 ||
+        getValue(line, "MAINALTSTATUS") == "CHANGED") {
+      mainAltitudeSyncPending = false;
+      mainAltitudeSyncAttempts = 0;
+    }
   }
 
   String receivedMainAltitudeStatus =
@@ -1975,7 +2225,7 @@ void parseGroundStationLine(const String& line)
   }
   else if (
     line.indexOf("GS,HEALTH,") == 0 &&
-    receivedMainAltitude.length() > 0 &&
+    mainAltitudeValueValid(receivedMainAltitude) &&
     mainAltitudeCommandTime == 0
   )
   {
@@ -2117,36 +2367,11 @@ void readAtlas()
       inputLine +=
         receivedCharacter;
 
-      if (inputLine.length() > 350)
+      if (inputLine.length() > 767)
       {
         inputLine = "";
       }
     }
-  }
-}
-
-void readGroundGps()
-{
-  while (GroundGpsSerial.available())
-  {
-    groundGps.encode(
-      GroundGpsSerial.read()
-    );
-  }
-
-  if (
-    groundGps.location.isUpdated() &&
-    groundGps.location.isValid()
-  )
-  {
-    groundLatitude =
-      groundGps.location.lat();
-
-    groundLongitude =
-      groundGps.location.lng();
-
-    groundLastFixTime =
-      millis();
   }
 }
 
@@ -2181,10 +2406,10 @@ void handleData()
       millis() - lastPacketTime;
   }
 
-  bool groundFixValid =
-    groundLastFixTime > 0 &&
-    millis() - groundLastFixTime <
-    GS_FIX_TIMEOUT_MS;
+  bool groundReportFresh = groundGpsReportTime != 0 &&
+    millis() - groundGpsReportTime <= 3000UL;
+  bool groundFixValid = groundReportFresh && groundGpsFix &&
+    millis() - groundLastFixTime <= 3000UL;
 
   double onboardLatitude = 0.0;
   double onboardLongitude = 0.0;
@@ -2247,34 +2472,41 @@ void handleData()
       );
   }
 
-  uint32_t groundSatellites = 0;
-
-  if (groundGps.satellites.isValid())
-  {
-    groundSatellites =
-      groundGps.satellites.value();
-  }
-
-  double groundHdop = 0.0;
-
-  if (groundGps.hdop.isValid())
-  {
-    groundHdop =
-      groundGps.hdop.hdop();
-  }
-
-  unsigned long groundFixAge = 0;
-
-  if (groundGps.location.isValid())
-  {
-    groundFixAge =
-      groundGps.location.age();
-  }
+  uint32_t groundSatellites = groundReportFresh ? groundGpsSatellites : 0U;
+  unsigned long groundFixAge = groundGpsFix ? millis() - groundLastFixTime : UINT32_MAX;
 
   String json = "{";
 
   json += "\"latest\":\"";
   json += escapeJson(latestLine);
+  json += "\",";
+
+  json += "\"apoContinuity\":\"" + escapeJson(continuityApo) + "\",";
+  json += "\"mainContinuity\":\"" + escapeJson(continuityMain) + "\",";
+  json += "\"continuityFresh\":" + String(continuityReceived && millis() - continuityReplyMs < LINK_TIMEOUT_MS ? "true" : "false") + ",";
+  json += "\"continuityReceived\":" + String(continuityReceived ? "true" : "false") + ",";
+  json += "\"continuityAge\":" + String(continuityReceived ? millis() - continuityReplyMs : 0) + ",";
+
+  bool speedFresh = speedTelemetryReceived && millis() - speedTelemetryMs < 3000UL;
+  json += "\"mach\":\"" + escapeJson(speedFresh ? machEstimate : String("")) + "\",";
+  json += "\"gpsSpeedStatus\":\"" + escapeJson(speedFresh ? gpsSpeedQuality : String("STALE")) + "\",";
+  json += "\"gpsSpeedMmps\":\"" + escapeJson(speedFresh && gpsSpeedQuality == "OK" ? gpsSpeedMmps : String("")) + "\",";
+  json += "\"gpsSpeedAccuracyMmps\":\"" + escapeJson(gpsSpeedAccuracyMmps) + "\",";
+
+  json += "\"flightState\":\"";
+  json += escapeJson(flightStateCode);
+  json += "\",";
+
+  json += "\"armState\":\"";
+  json += escapeJson(armStateCode);
+  json += "\",";
+
+  json += "\"baroTrusted\":\"";
+  json += escapeJson(baroTrustCode);
+  json += "\",";
+
+  json += "\"eventFlags\":\"";
+  json += escapeJson(eventFlagsHex);
   json += "\",";
 
   json += "\"name\":\"";
@@ -2373,9 +2605,9 @@ void handleData()
   json += String(groundSatellites);
   json += ",";
 
-  json += "\"gsHdop\":";
-  json += String(groundHdop, 2);
-  json += ",";
+  json += "\"gsGpsStatus\":\"";
+  json += escapeJson(groundReportFresh ? groundGpsStatus : String("STALE"));
+  json += "\",";
 
   json += "\"gsFixAge\":";
   json += String(groundFixAge);
@@ -2444,6 +2676,11 @@ json += escapeJson(
     mainAltitudeStatus
 );
 json += "\",";
+
+  json += "\"flashUsageValid\":";
+  json += flashUsageValid ? "true," : "false,";
+  json += "\"flashInfoStatus\":\"" + flashInfoStatus + "\",";
+  json += "\"flashLogging\":\"" + flashLogging + "\",";
 
   json += "\"flashMaintenance\":";
   json += flashMaintenanceActive
@@ -2773,11 +3010,36 @@ void handleSetMainAltitude()
   );
 }
 
+static void serviceMainAltitudeSync()
+{
+  if (!mainAltitudeSyncPending) return;
+  // Leave the radio free for changes, flash operations and ground tests.
+  if (frequencyCommandTime != 0 || requestedLoraFrequency.length() > 0 ||
+      mainAltitudeCommandTime != 0 || requestedMainAltitudeFt.length() > 0 ||
+      flashMaintenanceActive || flashInfoRequestTime != 0 ||
+      gtPending.length() > 0 || gtCancelRequested ||
+      groundTestActiveState(gtReplyState)) return;
+  unsigned long now = millis();
+  // Vary the spacing relative to the 2-second onboard telemetry cycle.
+  // After five attempts, reduce traffic while waiting for a lost link.
+  unsigned long interval = mainAltitudeSyncAttempts >= 5 ? 30000UL :
+      2700UL + (unsigned long)mainAltitudeSyncAttempts * 170UL;
+  if (now - mainAltitudeSyncLastMs < interval) return;
+  AtlasSerial.print("HEALTH\r\n");
+  mainAltitudeSyncLastMs = now;
+  if (mainAltitudeSyncAttempts < 5) mainAltitudeSyncAttempts++;
+  if (currentMainAltitudeFt.length() == 0)
+    mainAltitudeStatus = "SYNCING";
+}
+
 void handleMainAltitudeInfo()
 {
-  AtlasSerial.print(
-    "HEALTH\r\n"
-  );
+  // Repeated browser requests do not restart or accelerate pending retries.
+  if (!mainAltitudeSyncPending) {
+    mainAltitudeSyncPending = true;
+    mainAltitudeSyncAttempts = 0;
+    mainAltitudeSyncLastMs = millis();
+  }
 
   mainAltitudeStatus =
     currentMainAltitudeFt.length() > 0
@@ -2793,6 +3055,14 @@ void handleMainAltitudeInfo()
 
 void handleFlashInfo()
 {
+  // Page opening is read-only. Avoid piling up queries during an active erase.
+  if ((flashInfoRequestTime != 0 && millis() - flashInfoRequestTime < 3000UL) ||
+      (flashMaintenanceActive && millis() - flashLastProgressTime < 6000UL))
+  {
+    server.send(200, "application/json", "{\"ok\":true}");
+    return;
+  }
+  flashInfoStatus = "WAITING";
   AtlasSerial.print(
     "FLASHINFO\r\n"
   );
@@ -2806,11 +3076,24 @@ void handleFlashInfo()
   );
 }
 
+void serviceFlashRecovery()
+{
+  // Recover a missed completion reply without ever resending an erase.
+  if (!flashMaintenanceActive || flashInfoRequestTime != 0 ||
+      millis() - flashLastProgressTime < 6000UL ||
+      millis() - flashRecoveryQueryTime < 10000UL) return;
+  flashRecoveryQueryTime = millis();
+  flashInfoRequestTime = millis();
+  flashInfoStatus = "WAITING";
+  AtlasSerial.print("FLASHINFO\r\n");
+}
+
 void handleClearBlackBox()
 {
   if (
     flashStatus == "COMMAND_SENT" ||
-    flashStatus == "CLEARING"
+    flashStatus == "CLEARING" ||
+    flashStatus == "VERIFYING"
   )
   {
     server.send(
@@ -2833,6 +3116,8 @@ void handleClearBlackBox()
   flashStatus = "COMMAND_SENT";
   flashMaintenanceActive = true;
   flashCommandTime = millis();
+  flashLastProgressTime = flashCommandTime;
+  flashVerify = "NOT RUN";
 
   Serial.println(
     "Sent to GS STM32: CLEARFLASH,CONFIRM=ERASE_W25Q128"
@@ -2986,13 +3271,6 @@ void setup()
     ATLAS_TX_PIN
   );
 
-  GroundGpsSerial.begin(
-    GS_GPS_BAUD,
-    SERIAL_8N1,
-    GS_GPS_RX_PIN,
-    GS_GPS_TX_PIN
-  );
-
   sdSPI.begin(
     SD_SCK_PIN,
     SD_MISO_PIN,
@@ -3097,6 +3375,9 @@ server.on(
   handleClearBlackBox
 );
 
+server.on("/ground-test", HTTP_POST, handleGroundTest);
+server.on("/ground-test-status", HTTP_POST, handleGroundTestStatus);
+
 server.onNotFound(
   handleNotFound
 );
@@ -3110,7 +3391,7 @@ void loop()
 {
   updateStatusLeds();
   readAtlas();
-  readGroundGps();
+  serviceMainAltitudeSync();
 
   if (
     frequencyCommandTime > 0 &&
@@ -3140,10 +3421,11 @@ void loop()
 
   if (
     flashInfoRequestTime > 0 &&
-    millis() - flashInfoRequestTime > 2500UL
+    millis() - flashInfoRequestTime > 4000UL
   )
   {
     flashInfoRequestTime = 0;
+    flashInfoStatus = "TIMEOUT";
   }
 
   if (
@@ -3157,5 +3439,6 @@ void loop()
     flashMaintenanceActive = false;
     flashCommandTime = 0;
   }
+  serviceFlashRecovery();
   server.handleClient();
 }
