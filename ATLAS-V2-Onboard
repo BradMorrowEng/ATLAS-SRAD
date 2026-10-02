@@ -1,5 +1,6 @@
 #include "main.h"
 #include "usb_device.h"
+#include "usbd_cdc_if.h"
 #include "fatfs.h"
 #include "ff.h"
 #include <string.h>
@@ -8,6 +9,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <stdarg.h>
+extern uint8_t USER_GetLastErrorStage(void);
 I2C_HandleTypeDef hi2c1;
 SPI_HandleTypeDef hspi1;
 SPI_HandleTypeDef hspi2;
@@ -102,6 +104,15 @@ UART_HandleTypeDef huart1;
 #define SDLOG_START_RETRY_INTERVAL_MS                 5000UL
 #define FLIGHT_SENSOR_HEALTH_RECHECK_MS                100UL
 
+#define CONTINUITY_SAMPLE_INTERVAL_MS                  100UL
+#define CONTINUITY_GOOD_MIN_RAW                       1000U
+#define CONTINUITY_OPEN_MAX_RAW                        700U
+#define CONTINUITY_CONFIRM_SAMPLES                       3U
+
+#define FLIGHT_RECOVERY_MAGIC                    0x53525441UL /* "ATRS" */
+#define FLIGHT_RECOVERY_VERSION                          1U
+#define FLIGHT_RECOVERY_SAVE_INTERVAL_MS               100UL
+
 #define ATLAS_IWDG_PRESCALER_BITS                         6U
 #define ATLAS_IWDG_RELOAD_VALUE                         999U
 
@@ -187,6 +198,7 @@ UART_HandleTypeDef huart1;
 #define BLACKBOX_RECORD_SIZE         128UL
 #define BLACKBOX_LOG_INTERVAL_MS     100UL
 #define BLACKBOX_DEBUG_DELAY_MS      1500UL
+#define BLACKBOX_DEBUG_ENABLED          0U
 #define BLACKBOX_MAGIC               0x33564C42UL  /* "BLV3" */
 #define BLACKBOX_VERSION             3U
 #define BLACKBOX_RECORD_DATA         1U
@@ -200,39 +212,42 @@ UART_HandleTypeDef huart1;
 * Existing files are never overwritten.
 *
 * File layout:
-*   128-byte SDLogHeader_t
+*   512-byte sector-aligned SDLogHeader_t
 *   followed by fixed 64-byte SDLogRecord_t records.
 *
-* Record types are independent so each sensor group can be logged at the
-* rate that makes sense for it without wasting space.
+* IMU and high-G samples share one record. Each 200 Hz record contains one
+* sample from both IMUs and the two 400 Hz high-G samples acquired since the
+* previous IMU record. This preserves the requested sample rates while
+* reducing the sustained SD data rate.
 *
-* Current bring-up rates:
+* Current SD recording rates:
 *   IMU1 + IMU2        200 Hz
-*   ADXL372 high-G     500 Hz
+*   ADXL372 high-G     400 Hz
 *   Barometer           10 Hz
 *   GPS                  4 Hz
-*   Battery/continuity   10 Hz
+*   Battery/continuity    5 Hz
 */
 #define SDLOG_HEADER_MAGIC           0x324C5441UL  /* "ATL2" little-endian */
-#define SDLOG_HEADER_VERSION         2U
-#define SDLOG_HEADER_SIZE            128U
+#define SDLOG_HEADER_VERSION         4U
+#define SDLOG_HEADER_SIZE            512U
 #define SDLOG_RECORD_MAGIC           0xA752U
-#define SDLOG_RECORD_VERSION         2U
+#define SDLOG_RECORD_VERSION         4U
 #define SDLOG_RECORD_SIZE            64U
-#define SDLOG_TYPE_IMU               1U
-#define SDLOG_TYPE_HIGHG             2U
+#define SDLOG_TYPE_SENSOR_BUNDLE     1U
 #define SDLOG_TYPE_BARO              3U
 #define SDLOG_TYPE_GPS               4U
 #define SDLOG_TYPE_POWER             5U
 #define SDLOG_TYPE_EVENT             6U
 #define SDLOG_TYPE_FLIGHT_TRACE      7U
 #define SDLOG_IMU_INTERVAL_MS        5UL    /* 200 Hz */
-#define SDLOG_HIGHG_INTERVAL_MS      2UL    /* 500 Hz */
+#define SDLOG_HIGHG_RATE_HZ          400U
 #define SDLOG_BARO_INTERVAL_MS       100UL  /* 10 Hz */
 #define SDLOG_GPS_INTERVAL_MS        250UL  /* 4 Hz */
-#define SDLOG_POWER_INTERVAL_MS      100UL  /* 10 Hz */
-#define SDLOG_SYNC_INTERVAL_MS       1000UL
-#define SDLOG_BUFFER_SIZE            512U
+#define SDLOG_POWER_INTERVAL_MS      200UL  /* 5 Hz */
+#define SDLOG_SYNC_INTERVAL_MS       5000UL
+#define SDLOG_BUFFER_SIZE            8192U
+#define SDLOG_WRITE_CHUNK_SIZE        512U
+#define SDLOG_PREALLOCATED_SIZE   (8UL * 1024UL * 1024UL)
 #define CONT_ADC_SAMPLES             8UL
 static uint32_t current_lora_frequency_hz = LORA_DEFAULT_FREQUENCY_HZ;
 static uint32_t actual_lora_frequency_hz = LORA_DEFAULT_FREQUENCY_HZ;
@@ -265,6 +280,17 @@ static uint32_t baro_velocity_sample_sequence = 0;
 static uint8_t baro_filter_ready = 0;
 static uint32_t baro_velocity_time_ms = 0;
 static int32_t baro_velocity_alt_ft10 = 0;
+static uint8_t kalman_ready = 0;
+static uint8_t kalman_baro_trust_seen = 0;
+static uint32_t kalman_last_ms = 0;
+static float kalman_altitude_ft = 0.0f;
+static float kalman_velocity_fts = 0.0f;
+static float kalman_p00 = 100.0f;
+static float kalman_p01 = 0.0f;
+static float kalman_p10 = 0.0f;
+static float kalman_p11 = 100.0f;
+static int32_t kalman_altitude_ft10 = 0;
+static int32_t kalman_vertical_speed_ft10s = 0;
 typedef enum
 {
    FLIGHT_STATE_INITIALIZING = 0,
@@ -279,6 +305,12 @@ typedef enum
 } FlightState_t;
 typedef enum
 {
+   CONTINUITY_UNKNOWN = 0,
+   CONTINUITY_OPEN,
+   CONTINUITY_GOOD
+} ContinuityState_t;
+typedef enum
+{
    FLIGHT_EVENT_INIT_COMPLETE = 1,
    FLIGHT_EVENT_LAUNCH,
    FLIGHT_EVENT_BURNOUT,
@@ -291,7 +323,8 @@ typedef enum
    FLIGHT_EVENT_RECOVERY_MODE,
    FLIGHT_EVENT_PYRO_ARM_WOULD_ENABLE,
    FLIGHT_EVENT_PYRO_ARM_WOULD_DISABLE,
-   FLIGHT_EVENT_MAIN_ALTITUDE_SET
+   FLIGHT_EVENT_MAIN_ALTITUDE_SET,
+   FLIGHT_EVENT_WATCHDOG_RESTORED
 } FlightEvent_t;
 typedef enum
 {
@@ -364,6 +397,55 @@ static uint32_t flight_powered_peak_mg = 0;
 static uint32_t flight_gyro_mag_dps10 = 0;
 static int32_t flight_max_alt_ft10 = 0;
 static int32_t flight_landing_reference_alt_ft10 = 0;
+static uint16_t continuity_apo_raw = 0;
+static uint16_t continuity_main_raw = 0;
+static ContinuityState_t continuity_apo_state = CONTINUITY_UNKNOWN;
+static ContinuityState_t continuity_main_state = CONTINUITY_UNKNOWN;
+static ContinuityState_t continuity_apo_candidate = CONTINUITY_UNKNOWN;
+static ContinuityState_t continuity_main_candidate = CONTINUITY_UNKNOWN;
+static uint8_t continuity_apo_candidate_count = 0;
+static uint8_t continuity_main_candidate_count = 0;
+static uint32_t continuity_last_sample_ms = 0;
+
+typedef struct __attribute__((packed))
+{
+   uint32_t magic;
+   uint16_t version;
+   uint16_t size;
+   uint32_t sequence;
+   uint8_t flight_state;
+   uint8_t baro_trusted;
+   uint8_t launch_detected;
+   uint8_t burnout_detected;
+   uint8_t apogee_detected;
+   uint8_t drogue_fired;
+   uint8_t main_fired;
+   uint8_t landed_detected;
+   uint8_t gyro_turnover_seen;
+   uint8_t main_trigger;
+   uint8_t reserved0[2];
+   uint32_t event_flags;
+   int32_t baro_base_pa;
+   int32_t max_alt_ft10;
+   int32_t landing_reference_alt_ft10;
+   uint32_t main_deploy_alt_ft;
+   uint32_t since_launch_ms;
+   uint32_t since_burnout_ms;
+   uint32_t since_baro_trusted_ms;
+   uint32_t since_apogee_ms;
+   uint32_t since_main_detected_ms;
+   uint32_t since_landed_ms;
+   uint32_t checksum;
+} FlightRecoverySnapshot_t;
+
+static volatile FlightRecoverySnapshot_t flight_recovery_slots[2]
+   __attribute__((section(".noinit"), used));
+static FlightRecoverySnapshot_t flight_recovery_boot;
+static uint8_t flight_recovery_boot_valid = 0;
+static uint8_t flight_recovery_enabled = 0;
+static uint32_t flight_recovery_sequence = 0;
+static uint32_t flight_recovery_last_save_ms = 0;
+static uint32_t atlas_reset_flags = 0;
 typedef struct
 {
    uint8_t present;
@@ -489,11 +571,13 @@ typedef struct __attribute__((packed))
    uint8_t imu2_ok;
    uint8_t highg_ok;
    uint8_t mag_ok;
+   /* Raw RCC->CSR captured before reset flags are cleared. */
+   uint32_t reset_flags;
    /*
     * The remainder is reserved so future metadata can be added without
     * changing the 128-byte session-record size.
     */
-   uint8_t reserved[78];
+   uint8_t reserved[74];
    uint16_t crc16;
 } BlackBoxSessionRecord_t;
 typedef struct __attribute__((packed))
@@ -554,7 +638,9 @@ typedef struct __attribute__((packed))
     */
    uint16_t startup_status_flags;
    char system_name[16];
-   uint8_t reserved[70];
+   /* Raw RCC->CSR captured before reset flags are cleared. */
+   uint32_t reset_flags;
+   uint8_t reserved[450];
    uint16_t crc16;
 } SDLogHeader_t;
 typedef struct __attribute__((packed))
@@ -583,23 +669,24 @@ typedef struct __attribute__((packed))
    int16_t imu2_gx_dps10;
    int16_t imu2_gy_dps10;
    int16_t imu2_gz_dps10;
+   /* Two ADXL372 samples in 0.1 g units (ADXL372 native scale). */
+   int16_t highg_x_g10[2];
+   int16_t highg_y_g10[2];
+   int16_t highg_z_g10[2];
    uint8_t imu1_who;
    uint8_t imu2_who;
-   char flight_state[16];
-} SDLogIMUPayload_t;
-typedef struct __attribute__((packed))
-{
-   int32_t x_mg;
-   int32_t y_mg;
-   int32_t z_mg;
-   char flight_state[16];
-} SDLogHighGPayload_t;
+   uint8_t highg_age_ms[2];
+   uint8_t highg_sample_count;
+   uint8_t flight_state;
+} SDLogSensorBundlePayload_t;
 typedef struct __attribute__((packed))
 {
    int32_t pressure_pa;
    int32_t temperature_c100;
    int32_t altitude_ft10;
    int32_t vertical_speed_ft10s;
+   int32_t kalman_altitude_ft10;
+   int32_t kalman_vertical_speed_ft10s;
    char flight_state[16];
 } SDLogBaroPayload_t;
 typedef struct __attribute__((packed))
@@ -621,6 +708,8 @@ typedef struct __attribute__((packed))
    uint32_t battery_mv;
    uint16_t apo_sense_raw;
    uint16_t main_sense_raw;
+   uint8_t apo_continuity_state;
+   uint8_t main_continuity_state;
    char flight_state[16];
 } SDLogPowerPayload_t;
 typedef struct __attribute__((packed))
@@ -638,6 +727,8 @@ typedef struct __attribute__((packed))
    uint32_t gps_speed_3d_mmps;
    uint32_t battery_mv;
    uint32_t since_launch_ms;
+   int32_t kalman_altitude_ft10;
+   int32_t kalman_vertical_speed_ft10s;
 } SDLogEventPayload_t;
 typedef struct __attribute__((packed))
 {
@@ -649,13 +740,15 @@ typedef struct __attribute__((packed))
    uint8_t pyro_fire_would_be_high;
 } SDLogFlightTracePayload_t;
 _Static_assert(sizeof(SDLogHeader_t) == SDLOG_HEADER_SIZE,
-              "SDLogHeader_t must be 128 bytes");
+              "SDLogHeader_t must be 512 bytes");
 _Static_assert(sizeof(SDLogRecord_t) == SDLOG_RECORD_SIZE,
               "SDLogRecord_t must be 64 bytes");
-_Static_assert(sizeof(SDLogIMUPayload_t) <= 46,
-              "IMU payload too large");
-_Static_assert(sizeof(SDLogHighGPayload_t) <= 46,
-              "High-G payload too large");
+_Static_assert(SDLOG_WRITE_CHUNK_SIZE <= SDLOG_BUFFER_SIZE,
+              "SD write chunk exceeds RAM buffer");
+_Static_assert((SDLOG_WRITE_CHUNK_SIZE % SDLOG_RECORD_SIZE) == 0U,
+              "SD write chunk must contain whole records");
+_Static_assert(sizeof(SDLogSensorBundlePayload_t) <= 46,
+              "Sensor bundle payload too large");
 _Static_assert(sizeof(SDLogBaroPayload_t) <= 46,
               "Barometer payload too large");
 _Static_assert(sizeof(SDLogGPSPayload_t) <= 46,
@@ -678,12 +771,19 @@ static uint32_t sdlog_number = 0;
 static uint32_t sdlog_record_sequence = 0;
 static uint8_t sdlog_buffer[SDLOG_BUFFER_SIZE];
 static uint16_t sdlog_buffer_used = 0;
+static uint32_t sdlog_dropped_records = 0;
 static uint32_t sdlog_last_imu_ms = 0;
 static uint32_t sdlog_last_highg_ms = 0;
+static uint8_t sdlog_highg_interval_phase = 0;
+static int16_t sdlog_highg_x_g10[2];
+static int16_t sdlog_highg_y_g10[2];
+static int16_t sdlog_highg_z_g10[2];
+static uint32_t sdlog_highg_sample_ms[2];
+static uint8_t sdlog_highg_sample_count = 0;
+static uint8_t sdlog_highg_valid_mask = 0;
 static uint32_t sdlog_last_baro_ms = 0;
 static uint32_t sdlog_last_gps_ms = 0;
 static uint32_t sdlog_last_power_ms = 0;
-static uint32_t sdlog_last_sync_ms = 0;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
@@ -699,6 +799,10 @@ static uint16_t Battery_ADC_ReadRaw(void);
 static uint32_t Battery_ReadMillivolts(void);
 static uint16_t Continuity_ReadApoRaw(void);
 static uint16_t Continuity_ReadMainRaw(void);
+static void Continuity_Service(uint32_t now_ms);
+static const char *Continuity_StateName(ContinuityState_t state);
+static void Kalman_Reset(int32_t altitude_ft10, uint32_t now_ms);
+static void Kalman_Update(int32_t altitude_ft10, uint32_t now_ms);
 /* Camera-visible flight-event indicator outputs. */
 static void FlightOutputs_Safe(void);
 static void FlightOutputs_Service(uint32_t now_ms);
@@ -733,6 +837,11 @@ static uint32_t FlightLogic_VectorMagnitude(
 static int16_t SaturateI32ToI16(int32_t value);
 static void ATLAS_WatchdogInit(void);
 static void ATLAS_WatchdogKick(void);
+static uint32_t FlightRecovery_Checksum(const FlightRecoverySnapshot_t *snapshot);
+static void FlightRecovery_PrepareBoot(void);
+static void FlightRecovery_Save(uint32_t now_ms);
+static void FlightRecovery_Service(uint32_t now_ms);
+static void FlightRecovery_Apply(uint32_t now_ms);
 /* --------------------------------------------------------------------------
 * Forward declarations required by the SD logger.
 * These MUST appear before the first SDLOG_* implementation below.
@@ -801,11 +910,14 @@ static void SDLOG_Debug(const char *format, ...)
    {
        length = (int)sizeof(line) - 1;
    }
-   HAL_UART_Transmit(
-       &huart1,
+   /*
+    * USB CDC is deliberately nonblocking.  If the host is disconnected or
+    * the previous diagnostic is still being sent, drop this message instead
+    * of delaying sensor service or flight-event detection.
+    */
+   (void)CDC_Transmit_FS(
        (uint8_t *)line,
-       (uint16_t)length,
-       1000
+       (uint16_t)length
    );
 }
 static uint8_t SDLOG_FindNextFile(
@@ -899,7 +1011,8 @@ static uint8_t SDLOG_FindNextFile(
 }
 static uint8_t SDLOG_WriteHeader(void)
 {
-   SDLogHeader_t header;
+   /* Static storage avoids placing the 512-byte header on the runtime stack. */
+   static SDLogHeader_t header;
    memset(
        &header,
        0,
@@ -913,10 +1026,10 @@ static uint8_t SDLOG_WriteHeader(void)
    header.lora_frequency_hz = actual_lora_frequency_hz;
    header.startup_battery_mv = Battery_ReadMillivolts();
    header.startup_baro_base_pa = baro_base_pa;
+   header.reset_flags = atlas_reset_flags;
    header.imu_rate_hz =
        (uint16_t)(1000UL / SDLOG_IMU_INTERVAL_MS);
-   header.highg_rate_hz =
-       (uint16_t)(1000UL / SDLOG_HIGHG_INTERVAL_MS);
+   header.highg_rate_hz = SDLOG_HIGHG_RATE_HZ;
    header.baro_rate_hz =
        (uint16_t)(1000UL / SDLOG_BARO_INTERVAL_MS);
    header.gps_rate_hz =
@@ -1037,15 +1150,62 @@ static uint8_t SDLOG_Start(void)
        );
        return 0;
    }
+   /*
+    * Reserve the complete file before flight. Runtime sector writes then
+    * follow an existing FAT chain and never need to grow the file or update
+    * its directory size. The file remains recoverable after sudden power
+    * loss without periodic metadata synchronization.
+    */
+   uint8_t allocation_marker = 0U;
+   UINT allocation_bytes_written = 0U;
+   result =
+       f_lseek(
+           &sdlog_file,
+           SDLOG_PREALLOCATED_SIZE - 1UL
+       );
+   if (result == FR_OK)
+   {
+       result =
+           f_write(
+               &sdlog_file,
+               &allocation_marker,
+               1U,
+               &allocation_bytes_written
+           );
+   }
+   if (
+       result == FR_OK &&
+       allocation_bytes_written == 1U
+   )
+   {
+       result = f_sync(&sdlog_file);
+   }
+   if (result == FR_OK)
+   {
+       result = f_lseek(&sdlog_file, 0U);
+   }
+   if (result != FR_OK || allocation_bytes_written != 1U)
+   {
+       SDLOG_Debug(
+           "\r\nSDLOG,PREALLOCATE=FAIL,FILE=%s,FRESULT=%u\r\n",
+           filename,
+           (unsigned int)result
+       );
+       f_close(&sdlog_file);
+       return 0;
+   }
    sdlog_record_sequence = 0;
    sdlog_buffer_used = 0;
+   sdlog_dropped_records = 0;
    uint32_t now_ms = HAL_GetTick();
    sdlog_last_imu_ms = now_ms;
    sdlog_last_highg_ms = now_ms;
+   sdlog_highg_interval_phase = 0U;
+   sdlog_highg_sample_count = 0U;
+   sdlog_highg_valid_mask = 0U;
    sdlog_last_baro_ms = now_ms;
    sdlog_last_gps_ms = now_ms;
    sdlog_last_power_ms = now_ms;
-   sdlog_last_sync_ms = now_ms;
    if (!SDLOG_WriteHeader())
    {
        SDLOG_Debug(
@@ -1065,52 +1225,109 @@ static uint8_t SDLOG_Start(void)
 }
 static uint8_t SDLOG_FlushBuffer(void)
 {
-   if (sdlog_buffer_used == 0)
+   /*
+    * Runtime writes are always complete physical sectors. Leaving a smaller
+    * tail in RAM prevents FatFs from performing a partial-sector
+    * read/modify/write cycle in the flight-control loop.
+    */
+   if (sdlog_buffer_used < SDLOG_WRITE_CHUNK_SIZE)
    {
        return 1;
    }
+   /* A busy card is normal. Leave the sector in RAM and retry later. */
+   if (!USER_IsCardReadyNonBlocking())
+   {
+       return 2;
+   }
+   const UINT bytes_to_write = SDLOG_WRITE_CHUNK_SIZE;
    UINT bytes_written = 0;
+   uint32_t write_start_ms = HAL_GetTick();
+   USER_BeginRuntimeTransaction();
    FRESULT result =
        f_write(
            &sdlog_file,
            sdlog_buffer,
-           sdlog_buffer_used,
+           bytes_to_write,
            &bytes_written
        );
+   USER_EndRuntimeTransaction();
+   uint32_t write_elapsed_ms = HAL_GetTick() - write_start_ms;
    if (
        result != FR_OK ||
-       bytes_written != sdlog_buffer_used
+       bytes_written != bytes_to_write
    )
    {
        SDLOG_Debug(
-           "\r\nSDLOG,WRITE=FAIL,FRESULT=%u,WANTED=%u,WROTE=%u\r\n",
+           "\r\nSDLOG,WRITE=FAIL,FRESULT=%u,WANTED=%u,WROTE=%u,"
+           "SDSTAGE=%u,ELAPSEDMS=%lu\r\n",
            (unsigned int)result,
-           (unsigned int)sdlog_buffer_used,
-           (unsigned int)bytes_written
+           (unsigned int)bytes_to_write,
+           (unsigned int)bytes_written,
+           (unsigned int)USER_GetLastErrorStage(),
+           (unsigned long)write_elapsed_ms
        );
        return 0;
    }
-   sdlog_buffer_used = 0;
+   sdlog_buffer_used -= (uint16_t)bytes_written;
+   if (sdlog_buffer_used > 0U)
+   {
+       memmove(
+           sdlog_buffer,
+           &sdlog_buffer[bytes_written],
+           sdlog_buffer_used
+       );
+   }
    return 1;
 }
 static uint8_t SDLOG_Sync(void)
 {
-   if (!SDLOG_FlushBuffer())
+   /*
+    * Do not force a data-sector write immediately before f_sync(). The card
+    * may still be programming that sector when FatFs starts its metadata
+    * update. Wait for a ready indication, then synchronize data already
+    * accepted by FatFs.
+    */
+   if (!USER_IsCardReadyNonBlocking())
    {
-       return 0;
+       return 2;
    }
+   /*
+    * Metadata synchronization can require several physical sectors: FAT,
+    * directory and FSInfo. Give only this infrequent operation a larger
+    * bounded budget. Normal sensor-data writes remain limited to 20 ms.
+    */
+   uint32_t sync_start_ms = HAL_GetTick();
+   USER_BeginRuntimeSyncTransaction();
    FRESULT result =
        f_sync(
            &sdlog_file
        );
+   uint32_t sync_elapsed_ms = HAL_GetTick() - sync_start_ms;
    if (result != FR_OK)
    {
+       uint8_t error_stage = USER_GetLastErrorStage();
+       USER_EndRuntimeTransaction();
+       /*
+        * Metadata sync is best-effort during flight. Any bounded sync error
+        * is deferred so a slow card never disables sensor-data logging.
+        * Actual f_write failures remain fatal in SDLOG_FlushBuffer().
+        */
        SDLOG_Debug(
-           "\r\nSDLOG,SYNC=FAIL,FRESULT=%u\r\n",
-           (unsigned int)result
+           "\r\nSDLOG,SYNC=DEFERRED,FRESULT=%u,SDSTAGE=%u,"
+           "ELAPSEDMS=%lu\r\n",
+           (unsigned int)result,
+           (unsigned int)error_stage,
+           (unsigned long)sync_elapsed_ms
        );
-       return 0;
+       return 2;
    }
+   USER_EndRuntimeTransaction();
+   SDLOG_Debug(
+       "\r\nSDLOG,SYNC=OK,ELAPSEDMS=%lu,BUFFER=%u,DROPPED=%lu\r\n",
+       (unsigned long)sync_elapsed_ms,
+       (unsigned int)sdlog_buffer_used,
+       (unsigned long)sdlog_dropped_records
+   );
    return 1;
 }
 static uint8_t SDLOG_AppendRecord(
@@ -1152,16 +1369,27 @@ static uint8_t SDLOG_AppendRecord(
            (uint16_t)(sizeof(record) - sizeof(record.crc16))
        );
    /*
-    * 64-byte records pack exactly 8 per 512-byte software buffer.
+    * Keep every scheduled sensor record. When the 8 KB RAM buffer fills,
+    * move one bounded 512-byte sector to FatFs and retain the unwritten tail.
     */
    if (
        (sdlog_buffer_used + sizeof(record)) >
        sizeof(sdlog_buffer)
    )
    {
-       if (!SDLOG_FlushBuffer())
+       uint8_t flush_result = SDLOG_FlushBuffer();
+       if (flush_result == 0U)
        {
            return 0;
+       }
+       if (
+           (sdlog_buffer_used + sizeof(record)) >
+           sizeof(sdlog_buffer)
+       )
+       {
+           /* Preserve flight processing when the card falls behind. */
+           sdlog_dropped_records++;
+           return 1;
        }
    }
    memcpy(
@@ -1173,7 +1401,7 @@ static uint8_t SDLOG_AppendRecord(
    sdlog_record_sequence++;
    if (sdlog_buffer_used == sizeof(sdlog_buffer))
    {
-       if (!SDLOG_FlushBuffer())
+       if (SDLOG_FlushBuffer() == 0U)
        {
            return 0;
        }
@@ -1182,7 +1410,7 @@ static uint8_t SDLOG_AppendRecord(
 }
 static void SDLOG_LogIMU(uint32_t now_ms)
 {
-   SDLogIMUPayload_t payload;
+   SDLogSensorBundlePayload_t payload;
    memset(
        &payload,
        0,
@@ -1200,12 +1428,7 @@ static void SDLOG_LogIMU(uint32_t now_ms)
            IMU2_CS_PIN,
            LSM6_WHO_AM_I
        );
-   snprintf(
-       payload.flight_state,
-       sizeof(payload.flight_state),
-       "%s",
-       FlightLogic_StateName(flight_state)
-   );
+   payload.flight_state = (uint8_t)flight_state;
    uint8_t imu1_current_ok =
        (payload.imu1_who == 0x69);
    uint8_t imu2_current_ok =
@@ -1246,6 +1469,16 @@ static void SDLOG_LogIMU(uint32_t now_ms)
        payload.imu2_gy_dps10 = SaturateI32ToI16(gy);
        payload.imu2_gz_dps10 = SaturateI32ToI16(gz);
    }
+   payload.highg_sample_count = sdlog_highg_sample_count;
+   for (uint8_t i = 0U; i < sdlog_highg_sample_count; i++)
+   {
+       payload.highg_x_g10[i] = sdlog_highg_x_g10[i];
+       payload.highg_y_g10[i] = sdlog_highg_y_g10[i];
+       payload.highg_z_g10[i] = sdlog_highg_z_g10[i];
+       uint32_t age_ms = now_ms - sdlog_highg_sample_ms[i];
+       payload.highg_age_ms[i] =
+           age_ms > 255UL ? 255U : (uint8_t)age_ms;
+   }
    uint16_t status = 0;
    if (imu1_current_ok)
    {
@@ -1255,9 +1488,17 @@ static void SDLOG_LogIMU(uint32_t now_ms)
    {
        status |= (1U << 1);
    }
+   if ((sdlog_highg_valid_mask & (1U << 0)) != 0U)
+   {
+       status |= (1U << 2);
+   }
+   if ((sdlog_highg_valid_mask & (1U << 1)) != 0U)
+   {
+       status |= (1U << 3);
+   }
    if (
        !SDLOG_AppendRecord(
-           SDLOG_TYPE_IMU,
+           SDLOG_TYPE_SENSOR_BUNDLE,
            now_ms,
            status,
            &payload,
@@ -1267,28 +1508,34 @@ static void SDLOG_LogIMU(uint32_t now_ms)
    {
        sdlog_ok = 0;
    }
+   sdlog_highg_sample_count = 0U;
+   sdlog_highg_valid_mask = 0U;
 }
 static void SDLOG_LogHighG(uint32_t now_ms)
 {
-   SDLogHighGPayload_t payload;
-   memset(
-       &payload,
-       0,
-       sizeof(payload)
-   );
-   snprintf(
-       payload.flight_state,
-       sizeof(payload.flight_state),
-       "%s",
-       FlightLogic_StateName(flight_state)
-   );
+   uint8_t slot = sdlog_highg_sample_count;
+   if (slot >= 2U)
+   {
+       /* Preserve the newest two samples if the superloop timing slips. */
+       sdlog_highg_x_g10[0] = sdlog_highg_x_g10[1];
+       sdlog_highg_y_g10[0] = sdlog_highg_y_g10[1];
+       sdlog_highg_z_g10[0] = sdlog_highg_z_g10[1];
+       sdlog_highg_sample_ms[0] = sdlog_highg_sample_ms[1];
+       sdlog_highg_valid_mask =
+           (uint8_t)((sdlog_highg_valid_mask >> 1) & 0x01U);
+       slot = 1U;
+       sdlog_highg_sample_count = 1U;
+   }
+   sdlog_highg_x_g10[slot] = 0;
+   sdlog_highg_y_g10[slot] = 0;
+   sdlog_highg_z_g10[slot] = 0;
+   sdlog_highg_sample_ms[slot] = now_ms;
    uint8_t current_ok = 0;
    if (highg_ok)
    {
        /*
-        * Read into naturally aligned locals first. SDLogHighGPayload_t is
-        * packed, so taking int32_t pointers directly to its members can
-        * create unaligned accesses on the STM32.
+        * Read into naturally aligned locals first, then scale the result
+        * into the packed sensor-bundle payload.
         */
        int32_t x_mg = 0;
        int32_t y_mg = 0;
@@ -1301,25 +1548,19 @@ static void SDLOG_LogHighG(uint32_t now_ms)
            );
        if (current_ok)
        {
-           payload.x_mg = x_mg;
-           payload.y_mg = y_mg;
-           payload.z_mg = z_mg;
+           sdlog_highg_x_g10[slot] =
+               SaturateI32ToI16(x_mg / 100);
+           sdlog_highg_y_g10[slot] =
+               SaturateI32ToI16(y_mg / 100);
+           sdlog_highg_z_g10[slot] =
+               SaturateI32ToI16(z_mg / 100);
        }
    }
-   uint16_t status =
-       current_ok ? 1U : 0U;
-   if (
-       !SDLOG_AppendRecord(
-           SDLOG_TYPE_HIGHG,
-           now_ms,
-           status,
-           &payload,
-           sizeof(payload)
-       )
-   )
+   if (current_ok)
    {
-       sdlog_ok = 0;
+       sdlog_highg_valid_mask |= (uint8_t)(1U << slot);
    }
+   sdlog_highg_sample_count = slot + 1U;
 }
 static void SDLOG_LogBaro(uint32_t now_ms)
 {
@@ -1333,6 +1574,9 @@ static void SDLOG_LogBaro(uint32_t now_ms)
    payload.temperature_c100 = baro_temp_c100;
    payload.altitude_ft10 = baro_filtered_alt_ft10;
    payload.vertical_speed_ft10s = baro_descent_ft10s;
+   payload.kalman_altitude_ft10 = kalman_altitude_ft10;
+   payload.kalman_vertical_speed_ft10s =
+       kalman_vertical_speed_ft10s;
    snprintf(
        payload.flight_state,
        sizeof(payload.flight_state),
@@ -1428,10 +1672,12 @@ static void SDLOG_LogPower(uint32_t now_ms)
    );
    payload.battery_mv =
        Battery_ReadMillivolts();
-   payload.apo_sense_raw =
-       Continuity_ReadApoRaw();
-   payload.main_sense_raw =
-       Continuity_ReadMainRaw();
+   payload.apo_sense_raw = continuity_apo_raw;
+   payload.main_sense_raw = continuity_main_raw;
+   payload.apo_continuity_state =
+       (uint8_t)continuity_apo_state;
+   payload.main_continuity_state =
+       (uint8_t)continuity_main_state;
    snprintf(
        payload.flight_state,
        sizeof(payload.flight_state),
@@ -1479,6 +1725,9 @@ static uint8_t SDLOG_LogFlightEvent(
    payload.gyro_mag_dps10 = flight_gyro_mag_dps10;
    payload.gps_speed_3d_mmps = gps.speed_3d_mmps;
    payload.battery_mv = Battery_ReadMillivolts();
+   payload.kalman_altitude_ft10 = kalman_altitude_ft10;
+   payload.kalman_vertical_speed_ft10s =
+       kalman_vertical_speed_ft10s;
    if (flight_launch_detected)
    {
        payload.since_launch_ms =
@@ -1567,7 +1816,8 @@ static void SDLOG_Service(uint32_t now_ms)
     */
    uint8_t recovery = FlightLogic_IsRecovery();
    uint32_t highg_interval_ms =
-       recovery ? RECOVERY_SD_HIGHG_INTERVAL_MS : SDLOG_HIGHG_INTERVAL_MS;
+       recovery ? RECOVERY_SD_HIGHG_INTERVAL_MS :
+       (sdlog_highg_interval_phase == 0U ? 2UL : 3UL);
    uint32_t imu_interval_ms =
        recovery ? RECOVERY_SD_IMU_INTERVAL_MS : SDLOG_IMU_INTERVAL_MS;
    uint32_t baro_interval_ms =
@@ -1576,14 +1826,16 @@ static void SDLOG_Service(uint32_t now_ms)
        recovery ? RECOVERY_SD_GPS_INTERVAL_MS : SDLOG_GPS_INTERVAL_MS;
    uint32_t power_interval_ms =
        recovery ? RECOVERY_SD_POWER_INTERVAL_MS : SDLOG_POWER_INTERVAL_MS;
-   uint32_t sync_interval_ms =
-       recovery ? RECOVERY_SD_SYNC_INTERVAL_MS : SDLOG_SYNC_INTERVAL_MS;
    if (
        (now_ms - sdlog_last_highg_ms) >=
        highg_interval_ms
    )
    {
        sdlog_last_highg_ms = now_ms;
+       if (!recovery)
+       {
+           sdlog_highg_interval_phase ^= 1U;
+       }
        SDLOG_LogHighG(now_ms);
        if (!sdlog_ok)
        {
@@ -1638,18 +1890,10 @@ static void SDLOG_Service(uint32_t now_ms)
            return;
        }
    }
-   /*
-    * Once per second push both the software buffer and FatFs metadata
-    * to the microSD. Sudden power removal can still lose the very tail,
-    * but the whole flight file will not be sitting only in RAM/cache.
-    */
-   if (
-       (now_ms - sdlog_last_sync_ms) >=
-       sync_interval_ms
-   )
+   /* Drain one complete sector whenever the card is ready. */
+   if (sdlog_buffer_used >= SDLOG_WRITE_CHUNK_SIZE)
    {
-       sdlog_last_sync_ms = now_ms;
-       if (!SDLOG_Sync())
+       if (SDLOG_FlushBuffer() == 0U)
        {
            sdlog_ok = 0;
            return;
@@ -1934,6 +2178,7 @@ static uint8_t BLACKBOX_StartSession(void)
    record.imu2_ok = imu2_ok;
    record.highg_ok = highg_ok;
    record.mag_ok = 0;
+   record.reset_flags = atlas_reset_flags;
    /*
     * Basic startup status flags:
     * bit 0 = barometer OK
@@ -2384,6 +2629,8 @@ static const char *FlightLogic_EventName(
            return "PYRO_ARM_LOW";
        case FLIGHT_EVENT_MAIN_ALTITUDE_SET:
            return "MAIN_ALT_SET";
+       case FLIGHT_EVENT_WATCHDOG_RESTORED:
+           return "WATCHDOG_RESTORED";
        default:
            return "UNKNOWN_EVENT";
    }
@@ -2566,6 +2813,10 @@ static void FlightLogic_LogEvent(
        (unsigned int)flight_baro_trusted,
        (unsigned long)flight_event_flags
    );
+   if (flight_recovery_enabled)
+   {
+       FlightRecovery_Save(now_ms);
+   }
 }
 static void FlightLogic_ResetBaroAfterHighSpeed(
    uint32_t now_ms
@@ -2634,19 +2885,22 @@ static void FlightLogic_Init(
        baro_filtered_alt_ft10;
    flight_landing_reference_alt_ft10 =
        baro_filtered_alt_ft10;
-   FlightLogic_LogEvent(
-       FLIGHT_EVENT_INIT_COMPLETE,
-       now_ms
-   );
-   /*
-    * Always log the active default/current main altitude once at startup.
-    * Any later GS change creates another MAIN_ALT_xxxxFT event, and the
-    * last pre-launch value is the value used for the flight.
-    */
-   FlightLogic_LogEvent(
-       FLIGHT_EVENT_MAIN_ALTITUDE_SET,
-       now_ms
-   );
+   if (!flight_recovery_boot_valid)
+   {
+       FlightLogic_LogEvent(
+           FLIGHT_EVENT_INIT_COMPLETE,
+           now_ms
+       );
+       /*
+        * Always log the active default/current main altitude once at startup.
+        * Any later GS change creates another MAIN_ALT_xxxxFT event, and the
+        * last pre-launch value is the value used for the flight.
+        */
+       FlightLogic_LogEvent(
+           FLIGHT_EVENT_MAIN_ALTITUDE_SET,
+           now_ms
+       );
+   }
 }
 static void FlightLogic_Service(
    uint32_t now_ms
@@ -3472,6 +3726,10 @@ static uint8_t BLACKBOX_LogCurrentData(
 int main(void)
 {
    HAL_Init();
+   /* Capture reset cause before clearing RCC flags or touching snapshots. */
+   atlas_reset_flags = RCC->CSR;
+   FlightRecovery_PrepareBoot();
+   __HAL_RCC_CLEAR_RESET_FLAGS();
    SystemClock_Config();
    MX_GPIO_Init();
    /* Proven bench-test boot state: FIRE LOW first, ARM LOW second. */
@@ -3482,15 +3740,6 @@ int main(void)
    MX_SPI2_Init();
    MX_SPI3_Init();
    MX_USART1_UART_Init();
-   /* USART1 PA9 TX test for Nano Flip serial bridge */
-   const char uart_test[] =
-       "\r\nATLAS V2 USART1 PA9 TEST\r\n";
-   HAL_UART_Transmit(
-       &huart1,
-       (uint8_t *)uart_test,
-       (uint16_t)strlen(uart_test),
-       1000
-   );
    MX_USB_DEVICE_Init();
    /*
     * Register the CubeMX FatFs USER_Driver.
@@ -3565,7 +3814,19 @@ int main(void)
    baro_ok = MS5607_Init();
    if (baro_ok)
    {
-       Baro_SetBaseline();
+       if (
+           flight_recovery_boot_valid &&
+           flight_recovery_boot.baro_base_pa > 0
+       )
+       {
+           /* Preserve the original pad reference across a watchdog reset. */
+           baro_base_pa = flight_recovery_boot.baro_base_pa;
+           baro_filter_ready = 0;
+       }
+       else
+       {
+           Baro_SetBaseline();
+       }
    }
    gps.present = GPS_Init();
    lora_ok = LORA_Init();
@@ -3582,6 +3843,13 @@ int main(void)
     * SD failure does NOT stop the rest of ATLAS.
     */
    sdlog_ok = SDLOG_Start();
+   if (sdlog_ok)
+   {
+       /* Startup is complete. Keep all later SD waits tightly bounded so a
+        * slow or failed card cannot hold up the flight-control superloop.
+        */
+       USER_SetRuntimeMode();
+   }
    /*
     * Start the ATLAS V2 black-box logger.
     *
@@ -3625,10 +3893,41 @@ int main(void)
        }
    }
    /*
+    * Report the reset cause captured at the first line of main(), before
+    * RCC reset flags were cleared. The same raw value is stored in the SD
+    * header and W25 session header for retrieval without USB connected.
+    */
+   SDLOG_Debug(
+       "\r\nRESET,BOR=%u,POR=%u,PIN=%u,SFT=%u,IWDG=%u,WWDG=%u,LPWR=%u,"
+       "RAW=%08lX\r\n",
+       (unsigned int)((atlas_reset_flags & RCC_CSR_BORRSTF) != 0U),
+       (unsigned int)((atlas_reset_flags & RCC_CSR_PORRSTF) != 0U),
+       (unsigned int)((atlas_reset_flags & RCC_CSR_PINRSTF) != 0U),
+       (unsigned int)((atlas_reset_flags & RCC_CSR_SFTRSTF) != 0U),
+       (unsigned int)((atlas_reset_flags & RCC_CSR_IWDGRSTF) != 0U),
+       (unsigned int)((atlas_reset_flags & RCC_CSR_WWDGRSTF) != 0U),
+       (unsigned int)((atlas_reset_flags & RCC_CSR_LPWRRSTF) != 0U),
+       (unsigned long)atlas_reset_flags
+   );
+   /*
     * Initialization is now complete. Enter WAIT_FOR_LAUNCH and write the
     * first explicit flight-state event into both onboard loggers.
     */
    FlightLogic_Init(HAL_GetTick());
+   if (flight_recovery_boot_valid)
+   {
+       FlightRecovery_Apply(HAL_GetTick());
+       flight_recovery_enabled = 1;
+       FlightLogic_LogEvent(
+           FLIGHT_EVENT_WATCHDOG_RESTORED,
+           HAL_GetTick()
+       );
+   }
+   else
+   {
+       flight_recovery_enabled = 1;
+       FlightRecovery_Save(HAL_GetTick());
+   }
    uint32_t packet_number = 0;
    uint32_t last_telemetry_ms = 0;
    uint32_t last_led_ms = 0;
@@ -3665,6 +3964,8 @@ int main(void)
        FlightLogic_Service(now_ms);
        /* Maintain PB0 ARM and finish any active 500 ms APO/MAIN pulse. */
        FlightOutputs_Service(HAL_GetTick());
+       Continuity_Service(now_ms);
+       FlightRecovery_Service(now_ms);
        /*
         * Retry a transient boot-time SD start failure while still on the pad.
         * Once an SD session has started, later in-flight write failures are
@@ -3682,6 +3983,7 @@ int main(void)
            sdlog_ok = SDLOG_Start();
            if (sdlog_ok)
            {
+               USER_SetRuntimeMode();
                /* Re-create the current pre-launch context in the late-started
                 * SD log without duplicating black-box events.
                 */
@@ -3760,9 +4062,10 @@ int main(void)
         * After ~1.5 s, enough 10 Hz records exist to inspect the
         * session header plus the first five data records.
         *
-        * Output is sent on USART1 at 115200 baud as readable ASCII.
-        */
+        * Output is sent over USB CDC as readable ASCII.
+       */
        if (
+           BLACKBOX_DEBUG_ENABLED &&
            blackbox_ok &&
            !blackbox_debug_sent &&
            (now_ms - blackbox_debug_start_ms) >= BLACKBOX_DEBUG_DELAY_MS
@@ -4014,6 +4317,237 @@ static int16_t SaturateI32ToI16(int32_t value)
    }
    return (int16_t)value;
 }
+static uint32_t FlightRecovery_Checksum(
+   const FlightRecoverySnapshot_t *snapshot
+)
+{
+   const uint8_t *bytes = (const uint8_t *)snapshot;
+   uint32_t hash = 2166136261UL;
+   uint32_t checksum_offset =
+       (uint32_t)((const uint8_t *)&snapshot->checksum - bytes);
+   for (uint32_t i = 0; i < checksum_offset; i++)
+   {
+       hash ^= bytes[i];
+       hash *= 16777619UL;
+   }
+   return hash;
+}
+static uint8_t FlightRecovery_Valid(
+   const FlightRecoverySnapshot_t *snapshot
+)
+{
+   return (
+       snapshot->magic == FLIGHT_RECOVERY_MAGIC &&
+       snapshot->version == FLIGHT_RECOVERY_VERSION &&
+       snapshot->size == sizeof(FlightRecoverySnapshot_t) &&
+       snapshot->flight_state <= FLIGHT_STATE_FAULT &&
+       snapshot->main_trigger <= FLIGHT_MAIN_TRIGGER_EXCESSIVE_DESCENT &&
+       snapshot->baro_base_pa >= 1000 &&
+       snapshot->baro_base_pa <= 200000 &&
+       snapshot->main_deploy_alt_ft >= FLIGHT_MAIN_DEPLOY_MIN_ALT_FT &&
+       snapshot->main_deploy_alt_ft <= FLIGHT_MAIN_DEPLOY_MAX_ALT_FT &&
+       snapshot->checksum == FlightRecovery_Checksum(snapshot)
+   );
+}
+static void FlightRecovery_CopyFromVolatile(
+   FlightRecoverySnapshot_t *destination,
+   const volatile FlightRecoverySnapshot_t *source
+)
+{
+   uint8_t *destination_bytes = (uint8_t *)destination;
+   const volatile uint8_t *source_bytes =
+       (const volatile uint8_t *)source;
+   for (uint32_t i = 0; i < sizeof(*destination); i++)
+   {
+       destination_bytes[i] = source_bytes[i];
+   }
+}
+static void FlightRecovery_PrepareBoot(void)
+{
+   flight_recovery_boot_valid = 0;
+   if ((atlas_reset_flags & RCC_CSR_IWDGRSTF) == 0)
+   {
+       return;
+   }
+   FlightRecoverySnapshot_t slot0;
+   FlightRecoverySnapshot_t slot1;
+   FlightRecovery_CopyFromVolatile(&slot0, &flight_recovery_slots[0]);
+   FlightRecovery_CopyFromVolatile(&slot1, &flight_recovery_slots[1]);
+   uint8_t valid0 = FlightRecovery_Valid(&slot0);
+   uint8_t valid1 = FlightRecovery_Valid(&slot1);
+   if (!valid0 && !valid1)
+   {
+       return;
+   }
+   if (
+       valid1 &&
+       (!valid0 || (int32_t)(slot1.sequence - slot0.sequence) > 0)
+   )
+   {
+       flight_recovery_boot = slot1;
+   }
+   else
+   {
+       flight_recovery_boot = slot0;
+   }
+   flight_recovery_sequence = flight_recovery_boot.sequence;
+   flight_recovery_boot_valid = 1;
+}
+static void FlightRecovery_Save(uint32_t now_ms)
+{
+   if (!flight_recovery_enabled)
+   {
+       return;
+   }
+   FlightRecoverySnapshot_t snapshot;
+   memset(&snapshot, 0, sizeof(snapshot));
+   snapshot.magic = FLIGHT_RECOVERY_MAGIC;
+   snapshot.version = FLIGHT_RECOVERY_VERSION;
+   snapshot.size = sizeof(snapshot);
+   snapshot.sequence = ++flight_recovery_sequence;
+   snapshot.flight_state = (uint8_t)flight_state;
+   snapshot.baro_trusted = flight_baro_trusted;
+   snapshot.launch_detected = flight_launch_detected;
+   snapshot.burnout_detected = flight_burnout_detected;
+   snapshot.apogee_detected = flight_apogee_detected;
+   snapshot.drogue_fired = flight_drogue_would_fire;
+   snapshot.main_fired = flight_main_would_fire;
+   snapshot.landed_detected = flight_landed_detected;
+   snapshot.gyro_turnover_seen = flight_gyro_turnover_seen;
+   snapshot.main_trigger = (uint8_t)flight_main_trigger;
+   snapshot.event_flags = flight_event_flags;
+   snapshot.baro_base_pa = baro_base_pa;
+   snapshot.max_alt_ft10 = flight_max_alt_ft10;
+   snapshot.landing_reference_alt_ft10 =
+       flight_landing_reference_alt_ft10;
+   snapshot.main_deploy_alt_ft = flight_main_deploy_alt_ft;
+   if (flight_launch_detected)
+   {
+       snapshot.since_launch_ms = now_ms - flight_launch_ms;
+   }
+   if (flight_burnout_detected)
+   {
+       snapshot.since_burnout_ms = now_ms - flight_burnout_ms;
+   }
+   if (flight_baro_trusted)
+   {
+       snapshot.since_baro_trusted_ms = now_ms - flight_baro_trusted_ms;
+   }
+   if (flight_apogee_detected)
+   {
+       snapshot.since_apogee_ms = now_ms - flight_apogee_ms;
+   }
+   if (flight_main_trigger != FLIGHT_MAIN_TRIGGER_NONE)
+   {
+       snapshot.since_main_detected_ms =
+           now_ms - flight_main_deploy_detected_ms;
+   }
+   if (flight_landed_detected)
+   {
+       snapshot.since_landed_ms = now_ms - flight_landed_ms;
+   }
+   snapshot.checksum = FlightRecovery_Checksum(&snapshot);
+
+   volatile FlightRecoverySnapshot_t *target =
+       &flight_recovery_slots[snapshot.sequence & 1UL];
+   target->magic = 0;
+   __DMB();
+   const uint8_t *source_bytes = (const uint8_t *)&snapshot;
+   volatile uint8_t *target_bytes = (volatile uint8_t *)target;
+   for (uint32_t i = sizeof(snapshot.magic); i < sizeof(snapshot); i++)
+   {
+       target_bytes[i] = source_bytes[i];
+   }
+   __DMB();
+   target->magic = FLIGHT_RECOVERY_MAGIC;
+   __DMB();
+   flight_recovery_last_save_ms = now_ms;
+}
+static void FlightRecovery_Service(uint32_t now_ms)
+{
+   if (
+       flight_recovery_enabled &&
+       (now_ms - flight_recovery_last_save_ms) >=
+           FLIGHT_RECOVERY_SAVE_INTERVAL_MS
+   )
+   {
+       FlightRecovery_Save(now_ms);
+   }
+}
+static void FlightRecovery_Apply(uint32_t now_ms)
+{
+   const FlightRecoverySnapshot_t *snapshot = &flight_recovery_boot;
+   flight_state = (FlightState_t)snapshot->flight_state;
+   flight_baro_trusted = snapshot->baro_trusted;
+   flight_launch_detected = snapshot->launch_detected;
+   flight_burnout_detected = snapshot->burnout_detected;
+   flight_apogee_detected = snapshot->apogee_detected;
+   flight_drogue_would_fire = snapshot->drogue_fired;
+   flight_main_would_fire = snapshot->main_fired;
+   flight_landed_detected = snapshot->landed_detected;
+   flight_gyro_turnover_seen = snapshot->gyro_turnover_seen;
+   flight_main_trigger = (FlightMainTrigger_t)snapshot->main_trigger;
+   flight_event_flags = snapshot->event_flags;
+   baro_base_pa = snapshot->baro_base_pa;
+   flight_max_alt_ft10 = snapshot->max_alt_ft10;
+   flight_landing_reference_alt_ft10 =
+       snapshot->landing_reference_alt_ft10;
+   flight_main_deploy_alt_ft = snapshot->main_deploy_alt_ft;
+   flight_launch_ms = now_ms - snapshot->since_launch_ms;
+   flight_burnout_ms = now_ms - snapshot->since_burnout_ms;
+   flight_baro_trusted_ms = now_ms - snapshot->since_baro_trusted_ms;
+   flight_apogee_ms = now_ms - snapshot->since_apogee_ms;
+   flight_main_deploy_detected_ms =
+       now_ms - snapshot->since_main_detected_ms;
+   flight_landed_ms = now_ms - snapshot->since_landed_ms;
+
+   /* Normalize snapshots captured inside a multi-step event transition. */
+   if (
+       flight_apogee_detected &&
+       flight_state < FLIGHT_STATE_DROGUE_DESCENT
+   )
+   {
+       flight_state = FLIGHT_STATE_DROGUE_DESCENT;
+   }
+   if (
+       flight_main_would_fire &&
+       flight_state < FLIGHT_STATE_MAIN_DESCENT
+   )
+   {
+       flight_state = FLIGHT_STATE_MAIN_DESCENT;
+   }
+   if (
+       flight_landed_detected &&
+       flight_state < FLIGHT_STATE_LANDED
+   )
+   {
+       flight_state = FLIGHT_STATE_LANDED;
+   }
+
+   flight_launch_candidate_ms = 0;
+   flight_burnout_candidate_ms = 0;
+   flight_baro_trust_candidate_ms = 0;
+   flight_apogee_candidate_ms = 0;
+   flight_main_candidate_ms = 0;
+   flight_main_emergency_candidate_ms = 0;
+   flight_landing_candidate_ms = 0;
+   flight_last_logic_ms = now_ms;
+   flight_last_sensor_health_ms = now_ms;
+   baro_filter_ready = 0;
+   kalman_ready = 0;
+   kalman_baro_trust_seen = 0;
+
+   FlightOutputs_Safe();
+   flight_pyro_arm_would_be_high =
+       flight_launch_detected &&
+       !flight_landed_detected &&
+       flight_state != FLIGHT_STATE_FAULT;
+   if (flight_pyro_arm_would_be_high)
+   {
+       FlightOutputs_Arm();
+   }
+   flight_recovery_last_save_ms = now_ms;
+}
 static void ATLAS_WatchdogInit(void)
 {
    /* Configure IWDG without adding a CubeMX/HAL-IWDG dependency. */
@@ -4147,6 +4681,87 @@ static uint16_t Continuity_ReadMainRaw(void)
        2U,
        CONT_ADC_SAMPLES
    );
+}
+static ContinuityState_t Continuity_Classify(uint16_t raw)
+{
+   if (raw >= CONTINUITY_GOOD_MIN_RAW)
+   {
+       return CONTINUITY_GOOD;
+   }
+   if (raw <= CONTINUITY_OPEN_MAX_RAW)
+   {
+       return CONTINUITY_OPEN;
+   }
+   return CONTINUITY_UNKNOWN;
+}
+static void Continuity_UpdateState(
+   ContinuityState_t sample,
+   ContinuityState_t *state,
+   ContinuityState_t *candidate,
+   uint8_t *candidate_count
+)
+{
+   /* The gap between OPEN and GOOD is a hysteresis band. */
+   if (sample == CONTINUITY_UNKNOWN || sample == *state)
+   {
+       *candidate = CONTINUITY_UNKNOWN;
+       *candidate_count = 0;
+       return;
+   }
+   if (sample != *candidate)
+   {
+       *candidate = sample;
+       *candidate_count = 1;
+       return;
+   }
+   if (*candidate_count < CONTINUITY_CONFIRM_SAMPLES)
+   {
+       (*candidate_count)++;
+   }
+   if (*candidate_count >= CONTINUITY_CONFIRM_SAMPLES)
+   {
+       *state = sample;
+       *candidate = CONTINUITY_UNKNOWN;
+       *candidate_count = 0;
+   }
+}
+static void Continuity_Service(uint32_t now_ms)
+{
+   if (
+       (now_ms - continuity_last_sample_ms) <
+       CONTINUITY_SAMPLE_INTERVAL_MS
+   )
+   {
+       return;
+   }
+   continuity_last_sample_ms = now_ms;
+   continuity_apo_raw = Continuity_ReadApoRaw();
+   continuity_main_raw = Continuity_ReadMainRaw();
+   Continuity_UpdateState(
+       Continuity_Classify(continuity_apo_raw),
+       &continuity_apo_state,
+       &continuity_apo_candidate,
+       &continuity_apo_candidate_count
+   );
+   Continuity_UpdateState(
+       Continuity_Classify(continuity_main_raw),
+       &continuity_main_state,
+       &continuity_main_candidate,
+       &continuity_main_candidate_count
+   );
+}
+static const char *Continuity_StateName(ContinuityState_t state)
+{
+   switch (state)
+   {
+       case CONTINUITY_OPEN:
+           return "OPEN";
+       case CONTINUITY_GOOD:
+           return "GOOD";
+       case CONTINUITY_UNKNOWN:
+       default:
+           return "UNKNOWN";
+   }
 }
 static void FLASH_Select(void)
 {
@@ -4703,8 +5318,8 @@ static uint8_t BLACKBOX_LogCurrentData(
     * raw 12-bit ADC values already used by the SD power log.
     * PB2 AUX remains excluded and always stays LOW.
     */
-   record.apo_sense_raw = Continuity_ReadApoRaw();
-   record.main_sense_raw = Continuity_ReadMainRaw();
+   record.apo_sense_raw = continuity_apo_raw;
+   record.main_sense_raw = continuity_main_raw;
    /*
     * Camera-indicator GPIO state at this black-box sample:
     * bit 0 = PA0 APO indicator currently HIGH
@@ -4728,6 +5343,26 @@ static uint8_t BLACKBOX_LogCurrentData(
        record.pyro_state |= (1U << 1);
    }
    record.fault_flags = 0;
+   if (continuity_apo_state == CONTINUITY_GOOD)
+   {
+       record.fault_flags |= (1U << 0);
+   }
+   if (continuity_main_state == CONTINUITY_GOOD)
+   {
+       record.fault_flags |= (1U << 1);
+   }
+   if (continuity_apo_state == CONTINUITY_UNKNOWN)
+   {
+       record.fault_flags |= (1U << 2);
+   }
+   if (continuity_main_state == CONTINUITY_UNKNOWN)
+   {
+       record.fault_flags |= (1U << 3);
+   }
+   if (!sdlog_ok)
+   {
+       record.fault_flags |= (1U << 4);
+   }
    record.reserved[0] =
        (uint8_t)flight_state;
    memcpy(
@@ -4770,7 +5405,7 @@ static uint8_t BLACKBOX_LogCurrentData(
 }
 static void BLACKBOX_DebugReadCurrentSession(void)
 {
-   char line[220];
+   char line[512];
    /*
     * Read the current session header.
     */
@@ -4803,11 +5438,13 @@ static void BLACKBOX_DebugReadCurrentSession(void)
    );
    if (length > 0)
    {
-       HAL_UART_Transmit(
-           &huart1,
+       if (length >= (int)sizeof(line))
+       {
+           length = (int)sizeof(line) - 1;
+       }
+       (void)CDC_Transmit_FS(
            (uint8_t *)line,
-           (uint16_t)length,
-           200
+           (uint16_t)length
        );
    }
    /*
@@ -4944,11 +5581,13 @@ static void BLACKBOX_DebugReadCurrentSession(void)
        }
        if (length > 0)
        {
-           HAL_UART_Transmit(
-               &huart1,
+           if (length >= (int)sizeof(line))
+           {
+               length = (int)sizeof(line) - 1;
+           }
+           (void)CDC_Transmit_FS(
                (uint8_t *)line,
-               (uint16_t)length,
-               200
+               (uint16_t)length
            );
        }
    }
@@ -5127,13 +5766,15 @@ static void LORA_ServiceRx(void)
     */
    if (strcmp((char *)buffer, "CMD,HEALTH") == 0)
    {
-       char health[96];
+       char health[128];
        snprintf(
            health,
            sizeof(health),
-           "HEALTH,BB=%s,SD=%s,MAINALTFT=%lu,STATE=%s",
+           "HEALTH,BB=%s,SD=%s,APOC=%s,MAINC=%s,MAINALTFT=%lu,STATE=%s",
            blackbox_ok ? "OK" : "FAIL",
            sdlog_ok ? "OK" : "FAIL",
+           Continuity_StateName(continuity_apo_state),
+           Continuity_StateName(continuity_main_state),
            (unsigned long)flight_main_deploy_alt_ft,
            FlightLogic_StateName(flight_state)
        );
@@ -5908,6 +6549,68 @@ static uint8_t MS5607_Read(int32_t *pressure_pa, int32_t *temp_c100)
    *temp_c100 = (int32_t)temp;
    return 1;
 }
+static void Kalman_Reset(int32_t altitude_ft10, uint32_t now_ms)
+{
+   kalman_altitude_ft = (float)altitude_ft10 / 10.0f;
+   kalman_velocity_fts = 0.0f;
+   kalman_p00 = 100.0f;
+   kalman_p01 = 0.0f;
+   kalman_p10 = 0.0f;
+   kalman_p11 = 100.0f;
+   kalman_last_ms = now_ms;
+   kalman_altitude_ft10 = altitude_ft10;
+   kalman_vertical_speed_ft10s = 0;
+   kalman_ready = 1;
+}
+static void Kalman_Update(int32_t altitude_ft10, uint32_t now_ms)
+{
+   uint32_t dt_ms = now_ms - kalman_last_ms;
+   if (!kalman_ready || dt_ms == 0 || dt_ms > 2000UL)
+   {
+       Kalman_Reset(altitude_ft10, now_ms);
+       return;
+   }
+   float dt = (float)dt_ms / 1000.0f;
+   float dt2 = dt * dt;
+   float dt3 = dt2 * dt;
+   float dt4 = dt2 * dt2;
+   const float accel_noise = 100.0f;
+   const float measurement_noise = 25.0f;
+
+   kalman_altitude_ft += kalman_velocity_fts * dt;
+   float predicted_p00 =
+       kalman_p00 + dt * (kalman_p10 + kalman_p01) +
+       dt2 * kalman_p11 + 0.25f * dt4 * accel_noise;
+   float predicted_p01 =
+       kalman_p01 + dt * kalman_p11 + 0.5f * dt3 * accel_noise;
+   float predicted_p10 =
+       kalman_p10 + dt * kalman_p11 + 0.5f * dt3 * accel_noise;
+   float predicted_p11 =
+       kalman_p11 + dt2 * accel_noise;
+
+   float innovation =
+       ((float)altitude_ft10 / 10.0f) - kalman_altitude_ft;
+   float innovation_covariance =
+       predicted_p00 + measurement_noise;
+   float altitude_gain = predicted_p00 / innovation_covariance;
+   float velocity_gain = predicted_p10 / innovation_covariance;
+   kalman_altitude_ft += altitude_gain * innovation;
+   kalman_velocity_fts += velocity_gain * innovation;
+   kalman_p00 = (1.0f - altitude_gain) * predicted_p00;
+   kalman_p01 = (1.0f - altitude_gain) * predicted_p01;
+   kalman_p10 = predicted_p10 - velocity_gain * predicted_p00;
+   kalman_p11 = predicted_p11 - velocity_gain * predicted_p01;
+   kalman_last_ms = now_ms;
+
+   float altitude_x10 = kalman_altitude_ft * 10.0f;
+   float velocity_x10 = kalman_velocity_fts * 10.0f;
+   kalman_altitude_ft10 = (int32_t)(
+       altitude_x10 >= 0.0f ? altitude_x10 + 0.5f : altitude_x10 - 0.5f
+   );
+   kalman_vertical_speed_ft10s = (int32_t)(
+       velocity_x10 >= 0.0f ? velocity_x10 + 0.5f : velocity_x10 - 0.5f
+   );
+}
 static void Baro_SetBaseline(void)
 {
    int64_t sum = 0;
@@ -5954,6 +6657,8 @@ static void Baro_SetBaseline(void)
    baro_velocity_time_ms =
        HAL_GetTick();
    baro_filter_ready = 1;
+   kalman_baro_trust_seen = 0;
+   Kalman_Reset(0, HAL_GetTick());
 }
 static int32_t AltitudeFtX10(int32_t pressure_pa, int32_t base_pa)
 {
@@ -6021,6 +6726,23 @@ static void Baro_Service(uint32_t now_ms)
        return;
    }
    baro_alt_ft10 = AltitudeFtX10(baro_pressure_pa, baro_base_pa);
+   if (flight_baro_trusted)
+   {
+       if (!kalman_baro_trust_seen)
+       {
+           Kalman_Reset(baro_alt_ft10, now_ms);
+           kalman_baro_trust_seen = 1;
+       }
+       else
+       {
+           Kalman_Update(baro_alt_ft10, now_ms);
+       }
+   }
+   else
+   {
+       kalman_baro_trust_seen = 0;
+       Kalman_Update(baro_alt_ft10, now_ms);
+   }
    if (!baro_filter_ready)
    {
        baro_filtered_alt_ft10 = baro_alt_ft10;
@@ -6445,6 +7167,7 @@ void SystemClock_Config(void)
    RCC_OscInitStruct.PLL.PLLM = 8;
    RCC_OscInitStruct.PLL.PLLN = 96;
    RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+   /* 16 MHz HSE / 8 * 96 / 4 = 48 MHz for USB Full Speed. */
    RCC_OscInitStruct.PLL.PLLQ = 4;
    RCC_OscInitStruct.PLL.PLLR = 2;
    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
@@ -6634,5 +7357,4 @@ void Error_Handler(void)
        HAL_Delay(100);
    }
 }
-
 
